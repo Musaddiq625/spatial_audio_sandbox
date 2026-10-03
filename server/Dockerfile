@@ -1,9 +1,14 @@
 # Scene Director model endpoint — llama.cpp serving Gemma, OpenAI-compatible.
-# Weights are pulled from HuggingFace at boot (HF_TOKEN env secret on Render).
+# Weights are baked in at build time (ggml-org mirror isn't gated): no runtime
+# download, no token, no dependence on a writable home/cache dir.
 FROM ghcr.io/ggml-org/llama.cpp:server-v0.4.1
 
-# Distroless image (no shell): ENTRYPOINT is llama-server itself, so we pass
-# plain args via CMD. Render routes web traffic to port 10000 by default.
-# -hf pulls the Q4_K_M quant of gemma-3-1b-it (~800 MB) from HF at boot.
+RUN mkdir -p /models && \
+    curl -fL -o /models/gemma.gguf \
+      "https://huggingface.co/ggml-org/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q4_K_M.gguf" && \
+    chmod -R a+r /models
+
+# ENTRYPOINT is /app/llama-server — plain args via CMD.
+# Render routes web traffic to port 10000 by default.
 EXPOSE 10000
-CMD ["--host","0.0.0.0","--port","10000","-hf","ggml-org/gemma-3-1b-it-GGUF:Q4_K_M","-c","4096","-t","2"]
+CMD ["-m","/models/gemma.gguf","--host","0.0.0.0","--port","10000","-c","4096","-t","2"]
