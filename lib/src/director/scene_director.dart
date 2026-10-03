@@ -290,7 +290,7 @@ class SceneDirector {
       return;
     }
     final cur = const JsonEncoder.withIndent('').convert(
-      {'sources': _lastSpec!.sources.map(_sourceJson).toList()},
+      specToJson(_lastSpec!),
     );
     await describe('$prompt\n\ncurrent scene JSON (mutate it, keep unchanged fields): $cur');
   }
@@ -329,6 +329,12 @@ class SceneDirector {
         (tr.fromAzDeg + (tr.toAzDeg - tr.fromAzDeg) * k) * math.pi / 180;
     return Offset(tr.distM * math.cos(az), tr.distM * math.sin(az));
   }
+
+  /// Spec → JSON map; round-trips through [parseSpec]. Used by prompt
+  /// history persistence and by refine()'s "current scene" echo.
+  static Map<String, Object?> specToJson(SceneSpec spec) => {
+        'sources': spec.sources.map(_sourceJson).toList(),
+      };
 
   static Map<String, Object?> _sourceJson(SpecSource s) => {
         'name': s.name,

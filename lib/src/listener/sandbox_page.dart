@@ -1,8 +1,10 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math' as math;
 import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:spatial_audio_sandbox/src/director/llm_client.dart';
 import 'package:spatial_audio_sandbox/src/director/scene_director.dart';
 import 'package:spatial_audio_sandbox/src/director/sfx_client.dart';
@@ -41,10 +43,32 @@ class SourceDot {
 
 /// A sent prompt + the spec it generated — the chip replays the cached
 /// spec without another model call. spec stays null while generating.
+/// Serializes for SharedPreferences so history survives restarts.
 class _PromptEntry {
   _PromptEntry(this.prompt);
   final String prompt;
   SceneSpec? spec;
+
+  Map<String, Object?> toJson() => {
+    'prompt': prompt,
+    if (spec != null) 'spec': SceneDirector.specToJson(spec!),
+  };
+
+  static _PromptEntry? fromJson(Object? raw) {
+    if (raw is! Map) return null;
+    final prompt = raw['prompt'] as String?;
+    if (prompt == null) return null;
+    final e = _PromptEntry(prompt);
+    final spec = raw['spec'];
+    if (spec != null) {
+      try {
+        e.spec = SceneDirector.parseSpec(jsonEncode(spec));
+      } on SpecException {
+        return null;
+      }
+    }
+    return e;
+  }
 }
 
 const _kindColors = {
@@ -132,6 +156,7 @@ class _SandboxPageState extends State<SandboxPage> {
     );
     _pose.start();
     _link.start();
+    unawaited(_loadPrompts());
     _announceSub = _link.announces.listen((a) {
       if (a.apHost) _peerApHost = true;
       if (mounted && !_beacons.containsKey(a.id)) {
@@ -493,7 +518,31 @@ class _SandboxPageState extends State<SandboxPage> {
 
   /// A sent prompt + its generated spec — the chip replays it without
   /// another model call. spec stays null while the model is thinking.
+  /// Persisted to SharedPreferences; clips live in the SfxClient disk
+  /// cache, so a restart + chip tap replays fully offline.
   final _prompts = <_PromptEntry>[];
+  static const _historyKey = 'prompt_history_v1';
+  static const _historyCap = 20;
+
+  Future<void> _loadPrompts() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getStringList(_historyKey) ?? const [];
+      for (final s in raw) {
+        final e = _PromptEntry.fromJson(jsonDecode(s));
+        if (e != null && e.spec != null) _prompts.add(e);
+      }
+      if (mounted) setState(() {});
+    } catch (_) {/* corrupt history → start empty */}
+  }
+
+  Future<void> _savePrompts() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setStringList(
+      _historyKey,
+      _prompts.map((e) => jsonEncode(e.toJson())).toList(),
+    );
+  }
 
   bool _describing = false;
   Future<void> _describe() async {
@@ -503,6 +552,10 @@ class _SandboxPageState extends State<SandboxPage> {
     setState(() {
       _describing = true;
       _prompts.add(entry);
+      // FIFO cap — drop oldest completed entries.
+      while (_prompts.length > _historyCap) {
+        _prompts.removeAt(0);
+      }
     });
     try {
       entry.spec = await _director.describe(t);
@@ -510,6 +563,7 @@ class _SandboxPageState extends State<SandboxPage> {
         _prompts.remove(entry);
       } else {
         _promptCtl.clear();
+        unawaited(_savePrompts());
       }
     } finally {
       if (mounted) setState(() => _describing = false);
