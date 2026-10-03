@@ -28,6 +28,14 @@ class SourceDot {
   double z; // up, meters
 }
 
+/// A sent prompt + the spec it generated — the chip replays the cached
+/// spec without another model call. spec stays null while generating.
+class _PromptEntry {
+  _PromptEntry(this.prompt);
+  final String prompt;
+  SceneSpec? spec;
+}
+
 const _kindColors = {
   SourceKindWire.bee: Color(0xFFFFC107),
   SourceKindWire.rain: Color(0xFF4FC3F7),
@@ -292,6 +300,7 @@ class _SandboxPageState extends State<SandboxPage> {
   }
 
   Future<void> _stopEngine() async {
+    _director.setMotionPaused(true); // freeze directed dots on the radar
     await engineStop();
     // The engine dropped every source — ids are now stale.
     for (final b in _beacons.values) {
@@ -319,6 +328,7 @@ class _SandboxPageState extends State<SandboxPage> {
       for (final b in _beacons.values) {
         await _createBeaconSource(b);
       }
+      _director.setMotionPaused(false); // resume orbit ticks (live ids)
       setState(() {
         _engineOn = true;
         _info = info;
@@ -369,7 +379,7 @@ class _SandboxPageState extends State<SandboxPage> {
 
   // ----- scene director -----
 
-  Future<int?> _directedAdd(
+  Future<Object?> _directedAdd(
     SourceKindWire kind,
     Offset pos,
     double z,
@@ -387,46 +397,60 @@ class _SandboxPageState extends State<SandboxPage> {
         z: z,
         gain: gain,
       );
-      setState(
-        () => _sources.add(
-          SourceDot(id: id, kind: kind, pos: pos, gain: gain, z: z),
-        ),
-      );
-      return id;
+      final dot = SourceDot(id: id, kind: kind, pos: pos, gain: gain, z: z);
+      setState(() => _sources.add(dot));
+      return dot;
     } catch (e) {
       _toast('add source failed: $e');
       return null;
     }
   }
 
-  void _directedRemove(int id) {
-    removeSource(id: id);
-    setState(() => _sources.removeWhere((s) => s.id == id));
+  void _directedRemove(Object key) {
+    final dot = key as SourceDot;
+    removeSource(id: dot.id);
+    setState(() => _sources.remove(dot));
   }
 
-  void _directedSetPos(int id, Offset pos, double z) {
-    setSourcePosition(id: id, x: pos.dx, y: pos.dy, z: z);
-    for (final s in _sources) {
-      if (s.id == id) {
-        s.pos = pos;
-        s.z = z;
-        break;
-      }
-    }
+  // key is the SourceDot — its engine id is read live, so motion ticks
+  // keep working after an engine restart re-assigns ids.
+  void _directedSetPos(Object key, Offset pos, double z) {
+    final dot = key as SourceDot;
+    setSourcePosition(id: dot.id, x: pos.dx, y: pos.dy, z: z);
+    dot.pos = pos;
+    dot.z = z;
     if (mounted) setState(() {});
   }
+
+  /// A sent prompt + its generated spec — the chip replays it without
+  /// another model call. spec stays null while the model is thinking.
+  final _prompts = <_PromptEntry>[];
 
   bool _describing = false;
   Future<void> _describe() async {
     final t = _promptCtl.text.trim();
     if (t.isEmpty || _describing) return;
-    setState(() => _describing = true);
+    final entry = _PromptEntry(t);
+    setState(() {
+      _describing = true;
+      _prompts.add(entry);
+    });
     try {
-      await _director.describe(t);
-      _promptCtl.clear();
+      entry.spec = await _director.describe(t);
+      if (entry.spec == null) {
+        _prompts.remove(entry);
+      } else {
+        _promptCtl.clear();
+      }
     } finally {
       if (mounted) setState(() => _describing = false);
     }
+  }
+
+  Future<void> _replay(_PromptEntry e) async {
+    final spec = e.spec;
+    if (spec == null) return;
+    await _director.apply(spec);
   }
 
   Future<void> _demoScene() async {
@@ -472,6 +496,9 @@ class _SandboxPageState extends State<SandboxPage> {
       SnackBar(content: Text(msg), duration: const Duration(seconds: 2)),
     );
   }
+
+  static String _promptLabel(String p) =>
+      p.length > 30 ? '${p.substring(0, 29)}…' : p;
 
   // ----- layout -----
 
@@ -803,6 +830,36 @@ class _SandboxPageState extends State<SandboxPage> {
                 ),
             ],
           ),
+          if (_prompts.isNotEmpty)
+            Wrap(
+              spacing: 6,
+              children: [
+                for (final e in _prompts)
+                  e.spec == null
+                      ? Chip(
+                          visualDensity: VisualDensity.compact,
+                          avatar: const SizedBox(
+                            width: 12,
+                            height: 12,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          ),
+                          label: Text(
+                            _promptLabel(e.prompt),
+                            style: const TextStyle(fontSize: 11),
+                          ),
+                        )
+                      : ActionChip(
+                          visualDensity: VisualDensity.compact,
+                          tooltip: e.prompt,
+                          avatar: const Icon(Icons.auto_awesome, size: 14),
+                          label: Text(
+                            _promptLabel(e.prompt),
+                            style: const TextStyle(fontSize: 11),
+                          ),
+                          onPressed: () => _replay(e),
+                        ),
+              ],
+            ),
           _sectionLabel('Scenes:'),
           const SizedBox(height: 6),
           Wrap(

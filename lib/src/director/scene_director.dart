@@ -98,21 +98,28 @@ class SceneDirector {
     required this.llm,
   });
 
-  /// (kind, x, y, z, gain) -> engine source id. Returns null on failure.
-  final Future<int?> Function(SourceKindWire kind, Offset pos, double z, double gain) add;
-  final void Function(int id) remove;
-  final void Function(int id, Offset pos, double z) setPos;
+  /// (kind, x, y, z, gain) -> opaque page-side handle for the new source.
+  /// The handle must resolve the live engine id (ids are re-assigned on
+  /// engine restart). Returns null on failure.
+  final Future<Object?> Function(
+      SourceKindWire kind, Offset pos, double z, double gain) add;
+  final void Function(Object key) remove;
+  final void Function(Object key, Offset pos, double z) setPos;
   final void Function(String msg) onError;
   final LlmClient llm;
 
   final _motion = MotionBank();
-  final _owned = <int>{};
-  final _byName = <String, int>{};
+  final _owned = <Object>{};
+  final _byName = <String, Object>{};
   SceneSpec? _lastSpec;
   bool _busy = false;
 
   bool get busy => _busy;
   SceneSpec? get lastSpec => _lastSpec;
+
+  /// Pause/resume motion ticks — call on engine stop/start so radar dots
+  /// freeze while the engine is off and resume on restart.
+  void setMotionPaused(bool v) => _motion.paused = v;
 
   static const _kinds = {
     'bee': SourceKindWire.bee,
@@ -123,13 +130,14 @@ class SceneDirector {
     // 'click' excluded: one-shot probe, not a soundscape element.
   };
 
-  Future<void> describe(String prompt) async {
-    if (_busy) return;
+  /// Returns the applied spec (for prompt-history caching), null on error.
+  Future<SceneSpec?> describe(String prompt) async {
+    if (_busy) return null;
     final p = prompt.trim();
-    if (p.isEmpty) return;
+    if (p.isEmpty) return null;
     if (p.length > 500) {
       onError('keep it under 500 chars');
-      return;
+      return null;
     }
     _busy = true;
     try {
@@ -147,6 +155,7 @@ class SceneDirector {
         spec = parseSpec(raw2);
       }
       await apply(spec);
+      return spec;
     } on SpecException catch (e) {
       onError('director: ${e.message}');
     } catch (e) {
@@ -154,6 +163,7 @@ class SceneDirector {
     } finally {
       _busy = false;
     }
+    return null;
   }
 
   /// Direct apply — used by preset chips (no model call).
@@ -175,17 +185,20 @@ class SceneDirector {
               s.approach!.fromDistM * math.sin(s.approach!.fromAzDeg * math.pi / 180),
             )
           : (s.orbit != null ? _orbitPos(s, 0) : s.pos2d);
-      final id = await add(s.kind, start, s.z, s.gain);
-      if (id == null) continue;
-      _owned.add(id);
-      _byName[s.name] = id;
-      _motion.track(DirectedSource(id: id, spec: s, setPos: setPos));
+      final key = await add(s.kind, start, s.z, s.gain);
+      if (key == null) continue;
+      _owned.add(key);
+      _byName[s.name] = key;
+      _motion.track(DirectedSource(key: key, spec: s, setPos: setPos));
     }
   }
 
   /// Follow-up prompt mutates the current spec instead of replacing it.
   Future<void> refine(String prompt) async {
-    if (_lastSpec == null) return describe(prompt);
+    if (_lastSpec == null) {
+      await describe(prompt);
+      return;
+    }
     final cur = const JsonEncoder.withIndent('').convert(
       {'sources': _lastSpec!.sources.map(_sourceJson).toList()},
     );
@@ -193,8 +206,8 @@ class SceneDirector {
   }
 
   void clear() {
-    for (final id in _owned) {
-      remove(id);
+    for (final key in _owned) {
+      remove(key);
     }
     reset();
   }

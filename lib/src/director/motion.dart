@@ -4,14 +4,14 @@ import 'dart:ui';
 
 import 'scene_director.dart' show SpecSource;
 
-/// One directed source: engine id + its spec + the position setter.
-/// The id is looked up live at each tick so engine restarts (which
-/// re-assign ids) keep working.
+/// One directed source: opaque page-side handle + its spec + the position
+/// setter. The key resolves to the live engine id inside [setPos], so
+/// engine restarts (which re-assign ids) keep working.
 class DirectedSource {
-  DirectedSource({required this.id, required this.spec, required this.setPos});
-  int id;
+  DirectedSource({required this.key, required this.spec, required this.setPos});
+  final Object key;
   final SpecSource spec;
-  final void Function(int id, Offset pos, double z) setPos;
+  final void Function(Object key, Offset pos, double z) setPos;
   final t0 = DateTime.now();
 }
 
@@ -28,8 +28,8 @@ class MotionBank {
     _timer ??= Timer.periodic(const Duration(milliseconds: _tickMs), _tick);
   }
 
-  void untrack(int id) {
-    _entries.removeWhere((e) => e.id == id);
+  void untrack(Object key) {
+    _entries.removeWhere((e) => e.key == key);
     if (_entries.isEmpty) {
       _timer?.cancel();
       _timer = null;
@@ -44,7 +44,12 @@ class MotionBank {
 
   int get active => _entries.length;
 
+  /// Engine stopped — freeze the radar animation; tracked entries keep
+  /// their t0 so unpausing resumes the orbit at its natural phase.
+  bool paused = false;
+
   void _tick(Timer _) {
+    if (paused) return;
     final t = DateTime.now();
     for (final e in _entries) {
       final dt = t.difference(e.t0).inMilliseconds / 1000.0;
@@ -57,7 +62,7 @@ class MotionBank {
       } else {
         continue; // static sources need no ticks
       }
-      e.setPos(e.id, p, s.z);
+      e.setPos(e.key, p, s.z);
     }
   }
 
