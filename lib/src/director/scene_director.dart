@@ -1,8 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
-import 'dart:typed_data';
 import 'dart:ui';
+
+import 'package:flutter/foundation.dart';
 
 import '../rust/api/engine.dart';
 import 'llm_client.dart';
@@ -181,11 +182,17 @@ class SceneDirector {
   };
 
   /// Returns the applied spec (for prompt-history caching), null on error.
-  Future<SceneSpec?> describe(String prompt) async {
-    if (_busy) return null;
+  /// [capUserLen] enforces the 500-char user-prompt limit — refine() echoes
+  /// the current spec back to the model and legitimately exceeds it.
+  Future<SceneSpec?> describe(String prompt, {bool capUserLen = true}) async {
+    if (_busy) {
+      debugPrint('[director] busy — dropped prompt: "${prompt.trim()}"');
+      onError('scene director is busy — wait for the current prompt');
+      return null;
+    }
     final p = prompt.trim();
     if (p.isEmpty) return null;
-    if (p.length > 500) {
+    if (capUserLen && p.length > 500) {
       onError('keep it under 500 chars');
       return null;
     }
@@ -205,6 +212,9 @@ class SceneDirector {
         spec = parseSpec(raw2);
       }
       await apply(spec);
+      debugPrint(
+        '[director] spec applied: ${spec.sources.map((s) => '${s.name}(kind:${s.kind.name},sound:${s.sound},loop:${s.loop},dur:${s.durationS},az:${s.azDeg},dist:${s.distM},mot:${s.orbit != null ? 'orbit' : s.approach != null ? 'approach' : s.traverse != null ? 'traverse' : 'none'})').join(' | ')}',
+      );
       return spec;
     } on SpecException catch (e) {
       onError('director: ${e.message}');
@@ -230,6 +240,9 @@ class SceneDirector {
     _lastSpec = spec;
     final wantSfx = spec.sources.any((s) => s.sound != null);
     final sfxOk = wantSfx && (sfx?.configured ?? false);
+    debugPrint(
+      '[director] apply: ${spec.sources.length} sources, wantSfx=$wantSfx sfxConfigured=${sfx?.configured}',
+    );
     if (wantSfx && !sfxOk) {
       onError('ELEVENLABS_API_KEY not set — procedural stand-ins only');
     }
@@ -256,15 +269,20 @@ class SceneDirector {
   /// traverse/orbit begins as the real audio lands — not at apply time.
   Future<void> _genFor(SpecSource s, Object key) async {
     onStatus?.call(s.name, SfxStatus.generating);
+    debugPrint('[sfx] ${s.name}: generating "${s.sound}" (${s.durationS}s, loop=${s.loop})');
     try {
       final bytes = await sfx!.generate(
         s.sound!,
         durationSeconds: s.durationS,
         loop: s.loop,
       );
-      if (!_owned.contains(key)) return; // scene was cleared mid-flight
+      if (!_owned.contains(key)) {
+        debugPrint('[sfx] ${s.name}: clip landed but scene was cleared');
+        return;
+      }
       upgrade?.call(key, bytes, s.loop);
       _motion.restart(key);
+      debugPrint('[sfx] ${s.name}: ${bytes.length}B — live');
       onStatus?.call(s.name, SfxStatus.ready);
       if (!s.loop) {
         // One-shot: the engine self-removes the finished source — drop
@@ -278,6 +296,7 @@ class SceneDirector {
         });
       }
     } catch (e) {
+      debugPrint('[sfx] ${s.name}: FAILED — $e');
       onStatus?.call(s.name, SfxStatus.failed);
       onError('sfx ${s.name}: $e');
     }
@@ -289,10 +308,19 @@ class SceneDirector {
       await describe(prompt);
       return;
     }
+    final p = prompt.trim();
+    if (p.isEmpty) return;
+    if (p.length > 500) {
+      onError('keep it under 500 chars');
+      return;
+    }
     final cur = const JsonEncoder.withIndent('').convert(
       specToJson(_lastSpec!),
     );
-    await describe('$prompt\n\ncurrent scene JSON (mutate it, keep unchanged fields): $cur');
+    await describe(
+      '$p\n\ncurrent scene JSON (mutate it, keep unchanged fields): $cur',
+      capUserLen: false,
+    );
   }
 
   void clear() {
@@ -394,6 +422,7 @@ class SceneDirector {
     if (list.length > 8) throw SpecException('too many sources (max 8)');
 
     final sources = <SpecSource>[];
+    final seenNames = <String>{};
     for (final (i, e) in list.indexed) {
       if (e is! Map) throw SpecException('source $i is not an object');
       final kindName = (e['kind'] as String?)?.toLowerCase();
@@ -401,10 +430,14 @@ class SceneDirector {
       if (kind == null) {
         throw SpecException('unknown kind "${e['kind']}" (use: ${_kinds.keys.join(', ')})');
       }
+      var name = (e['name'] as String?)?.trim().isNotEmpty == true
+          ? (e['name'] as String).trim()
+          : '$kindName$i';
+      while (!seenNames.add(name)) {
+        name = '${name}_'; // duplicate names — suffix to keep them distinct
+      }
       final s = SpecSource(
-        name: (e['name'] as String?)?.trim().isNotEmpty == true
-            ? (e['name'] as String).trim()
-            : '$kindName$i',
+        name: name,
         kind: kind,
         azDeg: _clampNum(e['az'], -180, 180, 0),
         elDeg: _clampNum(e['el'], -90, 90, 0),
@@ -477,7 +510,10 @@ class SceneDirector {
             'duration_s': {'type': 'number'},
             'motion': {'type': 'object'},
           },
-          'required': ['name', 'kind', 'az', 'el', 'dist', 'gain'],
+          'required': [
+            'name', 'kind', 'sound', 'loop', 'duration_s',
+            'az', 'el', 'dist', 'gain',
+          ],
         },
       },
     },
@@ -491,9 +527,9 @@ Kinds: bee (any buzzing insect — fly, mosquito, wasp), rain (steady hiss+dropl
 
 Coordinates: az=0 front, +90 left, -90 right, ±180 behind. el=+deg above the head plane. dist in meters (0.3 close-up … 30 far). Max 8 sources. Orbit periods ≥4s or the spatial image smears. Words like "behind"/"left"/"above" must be reflected in az/el.
 
-Optional per-source motion: "motion":{"orbit":{"radius":m,"period_s":s}} for circling, "motion":{"approach":{"from_az":deg,"from_dist":m,"seconds":s}} for a source flying toward the listener, or "motion":{"traverse":{"from_az":deg,"to_az":deg,"dist":m,"seconds":s}} for a source crossing space (left→right, front→behind).
+Per-source motion — whenever the user says a source orbits, approaches, flies past, or crosses space (left→right, front→behind, sweeping by), you MUST attach a "motion" object to that source: "motion":{"orbit":{"radius":m,"period_s":s}} for circling, "motion":{"approach":{"from_az":deg,"from_dist":m,"seconds":s}} for a source flying toward the listener, or "motion":{"traverse":{"from_az":deg,"to_az":deg,"dist":m,"seconds":s}} for a source crossing space. A source described as moving but left without "motion" is a bug — static sources have no "motion" key.
 
-For each real-world sound the user names, also set "sound": a short literal audio description for a sound-effects generator ("campfire crackling on dry wood", "children playing outdoors", "dragon roar with heavy wing beats"). Omit "sound" only for abstract requests. "loop":true for continuous ambience (beds, weather, crowds), false for one-shot events (a flyby, a roar, thunder). "duration_s": 4-10 for loops, 3-6 for one-shots.
+Every source MUST have "sound": a short literal audio description for a sound-effects generator ("campfire crackling on dry wood", "children playing outdoors", "dragon roar with heavy wing beats"). Never omit it. "loop":true for continuous ambience (beds, weather, crowds), false for one-shot events (a flyby, a roar, thunder). "duration_s": 4-10 for loops, 3-6 for one-shots.
 
 Examples:
 "rain all around, bee circling close in front" → {"sources":[{"name":"rain","kind":"rain","sound":"steady rain falling outdoors","loop":true,"duration_s":8,"az":0,"el":0,"dist":2.0,"gain":1.0},{"name":"bee","kind":"bee","sound":"bee buzzing","loop":true,"duration_s":6,"az":0,"el":0.2,"dist":0.5,"gain":1.0,"motion":{"orbit":{"radius":0.5,"period_s":6}}}]}

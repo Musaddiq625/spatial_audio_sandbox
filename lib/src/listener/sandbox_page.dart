@@ -484,7 +484,9 @@ class _SandboxPageState extends State<SandboxPage> {
         z: dot.z,
         gain: dot.gain,
       );
+      debugPrint('[sfx] ${dot.label}: file source live (id ${dot.id})');
     } catch (e) {
+      debugPrint('[sfx] ${dot.label}: addFileSource failed — $e');
       _toast('file source failed: $e');
     }
   }
@@ -843,8 +845,11 @@ class _SandboxPageState extends State<SandboxPage> {
 
   SourceDot? _hitTest(Offset local, Offset center, double scale) {
     for (final s in _sources) {
-      final p = center + Offset(-s.pos.dy * scale, -s.pos.dx * scale);
-      if ((local - p).distance < 26) return s;
+      var v = Offset(-s.pos.dy * scale, -s.pos.dx * scale);
+      if (v.distance > _rangeM * scale) {
+        v *= _rangeM * scale / v.distance; // far dots ride the edge ring
+      }
+      if ((local - (center + v)).distance < 26) return s;
     }
     return null;
   }
@@ -1226,9 +1231,14 @@ class _RadarPainter extends CustomPainter {
     );
     canvas.drawCircle(center, 5, Paint()..color = const Color(0xFF4CAF50));
 
-    // Sources.
+    // Sources. Dots beyond the range ring clamp to the edge (like
+    // beacons) instead of vanishing off-canvas.
     for (final s in sources) {
-      final p = center + Offset(-s.pos.dy * scale, -s.pos.dx * scale);
+      var v = Offset(-s.pos.dy * scale, -s.pos.dx * scale);
+      if (v.distance > rangeM * scale) {
+        v *= rangeM * scale / v.distance;
+      }
+      final p = center + v;
       final color = _kindColors[s.kind] ?? Colors.white;
       canvas.drawCircle(p, 10, Paint()..color = color.withValues(alpha: 0.25));
       canvas.drawCircle(p, 6, Paint()..color = color);

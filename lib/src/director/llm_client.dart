@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 
 /// OpenAI-compatible chat client for the self-hosted llama.cpp endpoint.
@@ -8,7 +9,7 @@ import 'package:http/http.dart' as http;
 ///   flutter run --dart-define=LLM_ENDPOINT=https://sas-llm.onrender.com
 class LlmClient {
   static const _endpoint = String.fromEnvironment('LLM_ENDPOINT');
-  static const _timeout = Duration(seconds: 60); // CPU inference is slow
+  static const _timeout = Duration(seconds: 90); // CPU inference is slow
 
   bool get configured => _endpoint.isNotEmpty;
 
@@ -23,6 +24,7 @@ class LlmClient {
     if (!configured) {
       throw StateError('LLM_ENDPOINT not set — run with --dart-define');
     }
+    debugPrint('[llm] → $_endpoint (${system.length + user.length} chars in)');
     final res = await http
         .post(
           Uri.parse('$_endpoint/v1/chat/completions'),
@@ -33,7 +35,7 @@ class LlmClient {
               {'role': 'user', 'content': user},
             ],
             'temperature': 0.2,
-            'max_tokens': 512,
+            'max_tokens': 768,
             if (jsonSchema != null)
               'response_format': {
                 'type': 'json_object',
@@ -43,6 +45,7 @@ class LlmClient {
         )
         .timeout(_timeout);
     if (res.statusCode != 200) {
+      debugPrint('[llm] ← http ${res.statusCode}: ${res.body}');
       throw StateError('llm http ${res.statusCode}');
     }
     final body = jsonDecode(res.body) as Map;
@@ -50,6 +53,9 @@ class LlmClient {
     if (choices == null || choices.isEmpty) {
       throw StateError('llm returned no choices');
     }
-    return (choices.first['message']?['content'] as String?) ?? '';
+    final content =
+        (choices.first['message']?['content'] as String?) ?? '';
+    debugPrint('[llm] ← spec: $content');
+    return content;
   }
 }

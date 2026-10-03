@@ -1,9 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 
@@ -43,7 +43,10 @@ class SfxClient {
     final key =
         '${text.trim().toLowerCase()}|${durationSeconds ?? 0}|$loop';
     final hit = _cache[key];
-    if (hit != null) return hit;
+    if (hit != null) {
+      debugPrint('[sfx] "$text": memory cache hit');
+      return hit;
+    }
 
     // Disk hit — survives restarts; cached prompts replay fully offline.
     try {
@@ -51,10 +54,12 @@ class SfxClient {
       if (await f.exists()) {
         final bytes = await f.readAsBytes();
         _cache[key] = bytes;
+        debugPrint('[sfx] "$text": disk cache hit (${bytes.length}B)');
         return bytes;
       }
     } catch (_) {/* fall through to the API */}
 
+    debugPrint('[sfx] "$text": calling ElevenLabs…');
     final res = await http
         .post(
           Uri.https('api.elevenlabs.io', '/v1/sound-generation', const {
@@ -73,9 +78,11 @@ class SfxClient {
         )
         .timeout(_timeout);
     if (res.statusCode != 200) {
+      debugPrint('[sfx] "$text": api ${res.statusCode} — ${res.body}');
       throw StateError('sfx http ${res.statusCode}');
     }
     final bytes = res.bodyBytes;
+    debugPrint('[sfx] "$text": api 200, ${bytes.length}B');
     _cache[key] = bytes;
     try {
       await (await _fileFor(key)).writeAsBytes(bytes, flush: true);
