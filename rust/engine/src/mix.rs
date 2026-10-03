@@ -18,6 +18,7 @@ pub enum Cmd {
     Remove { id: u32 },
     SetPos { id: u32, pos: Vec3 },
     SetGain { id: u32, gain: f32 },
+    Seek { id: u32, pos_s: f32 },
     SetMaster { gain: f32 },
     SetWet { wet: f32 },
 }
@@ -153,6 +154,11 @@ impl Mixer {
             Cmd::SetGain { id, gain } => {
                 if let Some(s) = self.sources.iter_mut().find(|s| s.id == id) {
                     s.gain = gain;
+                }
+            }
+            Cmd::Seek { id, pos_s } => {
+                if let Some(s) = self.sources.iter_mut().find(|s| s.id == id) {
+                    s.gen.seek(pos_s, self.sr);
                 }
             }
             Cmd::SetMaster { gain } => self.master = gain,

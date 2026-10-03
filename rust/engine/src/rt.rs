@@ -92,6 +92,11 @@ impl Engine {
         let _ = self.cmd_tx.push(Cmd::SetGain { id, gain });
     }
 
+    /// Move a file source's playhead; no-op for procedural sources.
+    pub fn seek_source(&mut self, id: u32, pos_s: f32) {
+        let _ = self.cmd_tx.push(Cmd::Seek { id, pos_s });
+    }
+
     pub fn set_master(&mut self, gain: f32) {
         let _ = self.cmd_tx.push(Cmd::SetMaster { gain });
     }

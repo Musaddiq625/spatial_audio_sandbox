@@ -179,6 +179,13 @@ pub fn remove_source(id: u32) {
     }
 }
 
+/// What a file source resolved to — the engine id plus the real decoded
+/// length (a generator may return shorter audio than requested).
+pub struct FileSourceInfo {
+    pub id: u32,
+    pub duration_s: f32,
+}
+
 /// Play an audio file through the spatial pipeline. `bytes` is any
 /// container symphonia probes (mp3/wav); decoding happens here on the
 /// caller's thread — the audio callback only reads a mono buffer.
@@ -189,7 +196,7 @@ pub fn add_file_source(
     y: f32,
     z: f32,
     gain: f32,
-) -> Result<u32> {
+) -> Result<FileSourceInfo> {
     let mut st = state().lock().map_err(|_| anyhow!("state poisoned"))?;
     let sr = st
         .engine
@@ -200,6 +207,7 @@ pub fn add_file_source(
     let id = st.next_id;
     st.next_id += 1;
     let pcm = decode_to_mono(&bytes, sr)?;
+    let duration_s = pcm.len() as f32 / sr;
     st.engine
         .as_mut()
         .unwrap()
@@ -210,7 +218,18 @@ pub fn add_file_source(
             id,
         )
         .map_err(|e| anyhow!(e))?;
-    Ok(id)
+    Ok(FileSourceInfo { id, duration_s })
+}
+
+/// Move a file source's playhead to `pos_s` seconds (clamped inside the
+/// clip; seeking back into a finished one-shot replays it).
+#[flutter_rust_bridge::frb(sync)]
+pub fn seek_source(id: u32, pos_s: f32) {
+    if let Ok(mut st) = state().lock() {
+        if let Some(e) = st.engine.as_mut() {
+            e.seek_source(id, pos_s);
+        }
+    }
 }
 
 /// Bytes (mp3/wav/…) → mono f32 at `dst_sr`, peak-normalized. Stereo is

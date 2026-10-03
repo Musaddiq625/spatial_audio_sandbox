@@ -82,7 +82,7 @@ Future<void> removeSource({required int id}) =>
 /// Play an audio file through the spatial pipeline. `bytes` is any
 /// container symphonia probes (mp3/wav); decoding happens here on the
 /// caller's thread — the audio callback only reads a mono buffer.
-Future<int> addFileSource({
+Future<FileSourceInfo> addFileSource({
   required List<int> bytes,
   required bool looping,
   required double x,
@@ -97,6 +97,11 @@ Future<int> addFileSource({
   z: z,
   gain: gain,
 );
+
+/// Move a file source's playhead to `pos_s` seconds (clamped inside the
+/// clip; seeking back into a finished one-shot replays it).
+void seekSource({required int id, required double posS}) =>
+    RustLib.instance.api.crateApiEngineSeekSource(id: id, posS: posS);
 
 /// S2 ear-test render: a source orbiting the head, written to a WAV file.
 Future<void> renderOrbitWav({
@@ -186,6 +191,26 @@ class EngineInfoWire {
           performanceMode == other.performanceMode &&
           sharingMode == other.sharingMode &&
           latencyMs == other.latencyMs;
+}
+
+/// What a file source resolved to — the engine id plus the real decoded
+/// length (a generator may return shorter audio than requested).
+class FileSourceInfo {
+  final int id;
+  final double durationS;
+
+  const FileSourceInfo({required this.id, required this.durationS});
+
+  @override
+  int get hashCode => id.hashCode ^ durationS.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FileSourceInfo &&
+          runtimeType == other.runtimeType &&
+          id == other.id &&
+          durationS == other.durationS;
 }
 
 /// FRB-friendly mirror of SourceKind.

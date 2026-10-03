@@ -30,6 +30,7 @@ class LlmClient {
     String system,
     String user, {
     Map<String, dynamic>? jsonSchema,
+    void Function(int chars)? onProgress,
   }) async {
     if (!configured) {
       throw StateError('LLM_ENDPOINT not set — run with --dart-define');
@@ -86,6 +87,7 @@ class LlmClient {
         final piece = delta?['content'] as String?;
         if (piece != null) {
           buf.write(piece);
+          onProgress?.call(buf.length);
           if (buf.length - lastLog >= 256) {
             lastLog = buf.length;
             debugPrint('[llm] … ${buf.length} chars received');

@@ -39,6 +39,11 @@ class SourceDot {
   Uint8List? fileBytes;
   bool looping = true;
   bool get isFile => fileBytes != null;
+
+  /// Real decoded clip length + playhead anchor — the seekbar's position
+  /// is estimated locally as (now - fileT0), not polled from Rust.
+  double? fileDurS;
+  DateTime? fileT0;
 }
 
 /// A sent prompt + the spec it generated — the chip replays the cached
@@ -180,6 +185,8 @@ class _SandboxPageState extends State<SandboxPage> {
   @override
   void dispose() {
     _statsTimer?.cancel();
+    _seekTicker?.cancel();
+    _describeTicker?.cancel();
     _pose.stop();
     _netSub?.cancel();
     _net.dispose();
@@ -349,6 +356,7 @@ class _SandboxPageState extends State<SandboxPage> {
       _engineOn = false;
       _info = null;
     });
+    _clearSeek();
   }
 
   Future<void> _startEngine() async {
@@ -356,22 +364,27 @@ class _SandboxPageState extends State<SandboxPage> {
       final info = await engineStart();
       // Fresh engine has no sources — re-add local dots and linked beacons.
       for (final s in _sources) {
-        s.id = s.isFile
-            ? await addFileSource(
-                bytes: s.fileBytes!,
-                looping: s.looping,
-                x: s.pos.dx,
-                y: s.pos.dy,
-                z: s.z,
-                gain: s.gain,
-              )
-            : await addSource(
-                kind: s.kind,
-                x: s.pos.dx,
-                y: s.pos.dy,
-                z: s.z,
-                gain: s.gain,
-              );
+        if (s.isFile) {
+          final info = await addFileSource(
+            bytes: s.fileBytes!,
+            looping: s.looping,
+            x: s.pos.dx,
+            y: s.pos.dy,
+            z: s.z,
+            gain: s.gain,
+          );
+          s.id = info.id;
+          s.fileDurS = info.durationS;
+          s.fileT0 = DateTime.now(); // playback restarts from 0
+        } else {
+          s.id = await addSource(
+            kind: s.kind,
+            x: s.pos.dx,
+            y: s.pos.dy,
+            z: s.z,
+            gain: s.gain,
+          );
+        }
       }
       for (final b in _beacons.values) {
         await _createBeaconSource(b);
@@ -476,7 +489,7 @@ class _SandboxPageState extends State<SandboxPage> {
     if (!_engineOn) return;
     try {
       removeSource(id: dot.id);
-      dot.id = await addFileSource(
+      final info = await addFileSource(
         bytes: bytes,
         looping: looping,
         x: dot.pos.dx,
@@ -484,11 +497,105 @@ class _SandboxPageState extends State<SandboxPage> {
         z: dot.z,
         gain: dot.gain,
       );
-      debugPrint('[sfx] ${dot.label}: file source live (id ${dot.id})');
+      dot.id = info.id;
+      dot.fileDurS = info.durationS;
+      dot.fileT0 = DateTime.now();
+      debugPrint('[sfx] ${dot.label}: file source live (id ${dot.id}, ${info.durationS.toStringAsFixed(1)}s)');
     } catch (e) {
       debugPrint('[sfx] ${dot.label}: addFileSource failed — $e');
       _toast('file source failed: $e');
     }
+  }
+
+  /// The file source currently shown on the seekbar — only generated
+  /// clips have a meaningful timeline (procedural kinds don't).
+  SourceDot? _seekTarget;
+  Timer? _seekTicker;
+
+  void _selectSeek(SourceDot s) {
+    setState(() => _seekTarget = _seekTarget == s ? null : s);
+    _seekTicker?.cancel();
+    if (_seekTarget != null) {
+      _seekTicker = Timer.periodic(const Duration(milliseconds: 250), (_) {
+        if (mounted) setState(() {});
+      });
+    }
+  }
+
+  void _clearSeek() {
+    _seekTarget = null;
+    _seekTicker?.cancel();
+    _seekTicker = null;
+  }
+
+  /// Estimated playhead position — local clock, wraps for loops,
+  /// clamps for one-shots.
+  double _filePos(SourceDot d) {
+    final t0 = d.fileT0;
+    final dur = d.fileDurS;
+    if (t0 == null || dur == null || dur <= 0) return 0;
+    final e = DateTime.now().difference(t0).inMilliseconds / 1000;
+    return d.looping ? e % dur : e.clamp(0.0, dur);
+  }
+
+  void _seekTo(SourceDot d, double pos) {
+    if (_engineOn) seekSource(id: d.id, posS: pos);
+    // Re-anchor the local estimate to the new playhead.
+    d.fileT0 = DateTime.now().subtract(
+      Duration(milliseconds: (pos * 1000).round()),
+    );
+    setState(() {});
+  }
+
+  Widget _seekRow(SourceDot d) {
+    final pos = _filePos(d);
+    final dur = d.fileDurS ?? 0;
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 60,
+            child: Text(
+              d.label,
+              style: const TextStyle(fontSize: 11),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          Expanded(
+            child: SizedBox(
+              height: 20,
+              child: SliderTheme(
+                data: SliderTheme.of(context).copyWith(
+                  trackHeight: 2,
+                  thumbShape: const RoundSliderThumbShape(
+                    enabledThumbRadius: 6,
+                  ),
+                  overlayShape: const RoundSliderOverlayShape(
+                    overlayRadius: 12,
+                  ),
+                ),
+                child: Slider(
+                  value: dur > 0 ? pos.clamp(0.0, dur) : 0,
+                  max: dur > 0 ? dur : 1,
+                  onChanged: _engineOn && dur > 0
+                      ? (v) => _seekTo(d, v)
+                      : null,
+                ),
+              ),
+            ),
+          ),
+          SizedBox(
+            width: 74,
+            child: Text(
+              '${pos.toStringAsFixed(1)} / ${dur.toStringAsFixed(1)}s',
+              style: const TextStyle(fontSize: 10, color: Color(0xFF9AA4B2)),
+              textAlign: TextAlign.right,
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   void _sfxStatus(String name, SfxStatus status) {
@@ -505,6 +612,7 @@ class _SandboxPageState extends State<SandboxPage> {
   void _directedRemove(Object key) {
     final dot = key as SourceDot;
     removeSource(id: dot.id);
+    if (_seekTarget == dot) _clearSeek();
     setState(() => _sources.remove(dot));
   }
 
@@ -557,20 +665,33 @@ class _SandboxPageState extends State<SandboxPage> {
   }
 
   bool _describing = false;
+  DateTime? _describeStarted;
+  int _llmChars = 0;
+  Timer? _describeTicker;
+
   Future<void> _describe() async {
     final t = _promptCtl.text.trim();
     if (t.isEmpty || _describing) return;
     final entry = _PromptEntry(t);
     setState(() {
       _describing = true;
+      _describeStarted = DateTime.now();
+      _llmChars = 0;
       _prompts.add(entry);
       // FIFO cap — drop oldest completed entries.
       while (_prompts.length > _historyCap) {
         _prompts.removeAt(0);
       }
     });
+    _describeTicker?.cancel();
+    _describeTicker = Timer.periodic(const Duration(milliseconds: 500), (_) {
+      if (mounted) setState(() {});
+    });
     try {
-      entry.spec = await _director.describe(t);
+      entry.spec = await _director.describe(
+        t,
+        onProgress: (n) => _llmChars = n,
+      );
       if (entry.spec == null) {
         _prompts.remove(entry);
       } else {
@@ -578,6 +699,8 @@ class _SandboxPageState extends State<SandboxPage> {
         unawaited(_savePrompts());
       }
     } finally {
+      _describeTicker?.cancel();
+      _describeTicker = null;
       if (mounted) setState(() => _describing = false);
     }
   }
@@ -600,11 +723,13 @@ class _SandboxPageState extends State<SandboxPage> {
     }
     _sources.clear();
     _director.reset();
+    _clearSeek();
     setState(() {});
   }
 
   void _removeSource(SourceDot s) {
     removeSource(id: s.id);
+    if (_seekTarget == s) _clearSeek();
     setState(() => _sources.remove(s));
   }
 
@@ -954,6 +1079,15 @@ class _SandboxPageState extends State<SandboxPage> {
               ),
             ],
           ),
+          if (_describing)
+            Padding(
+              padding: const EdgeInsets.only(top: 3, left: 2),
+              child: Text(
+                'Gemma… ${DateTime.now().difference(_describeStarted!).inSeconds}s'
+                '${_llmChars > 0 ? ' · receiving spec (${(_llmChars / 1000).toStringAsFixed(1)}k chars)' : ''}',
+                style: const TextStyle(fontSize: 10, color: Color(0xFF9AA4B2)),
+              ),
+            ),
           Wrap(
             spacing: 6,
             children: [
@@ -998,6 +1132,8 @@ class _SandboxPageState extends State<SandboxPage> {
                         ),
               ],
             ),
+          if (_seekTarget != null && _sources.contains(_seekTarget))
+            _seekRow(_seekTarget!),
           _sectionLabel('Scenes:'),
           const SizedBox(height: 6),
           Wrap(
@@ -1032,6 +1168,11 @@ class _SandboxPageState extends State<SandboxPage> {
                         color: _kindColors[s.kind] ?? Colors.white,
                       ),
                     ),
+                    avatar: s.isFile
+                        ? const Icon(Icons.audio_file, size: 14)
+                        : null,
+                    selected: _seekTarget == s,
+                    onPressed: s.isFile ? () => _selectSeek(s) : null,
                     deleteIcon: const Icon(Icons.close, size: 16),
                     onDeleted: () => _removeSource(s),
                     visualDensity: VisualDensity.compact,

@@ -9,6 +9,8 @@ pub trait Source: Send {
     fn is_finished(&self) -> bool {
         false
     }
+    /// Move the playhead — no-op for procedural sources.
+    fn seek(&mut self, _seconds: f32, _sr: f32) {}
 }
 
 /// What the UI can ask for. Kept FRB-friendly (plain enum).
@@ -281,6 +283,13 @@ impl Source for FileSource {
     fn is_finished(&self) -> bool {
         self.done
     }
+    fn seek(&mut self, seconds: f32, sr: f32) {
+        let i = (seconds.max(0.0) * sr) as usize;
+        self.idx = i.min(self.buf.len().saturating_sub(1));
+        // Seeking back into a finished one-shot revives it — it plays to
+        // the end and finishes again, which is what a seekbar expects.
+        self.done = self.buf.is_empty();
+    }
 }
 
 /// Pad: slow chord (A3 + C4 + E4) with staggered tremolo.
@@ -349,5 +358,22 @@ mod tests {
         let got: Vec<f32> = (0..5).map(|_| l.tick(48_000.0)).collect();
         assert_eq!(got, [1.0, -1.0, 1.0, -1.0, 1.0]);
         assert!(!l.is_finished());
+    }
+
+    #[test]
+    fn file_source_seeks_and_revives() {
+        // 4 samples at a fake 2 Hz rate: seek(s) → idx = s * 2.
+        let mut f = FileSource::new(vec![0.1, 0.2, 0.3, 0.4], false);
+        f.seek(1.0, 2.0); // → idx 2
+        assert_eq!(f.tick(48_000.0), 0.3);
+        assert_eq!(f.tick(48_000.0), 0.4);
+        assert!(f.is_finished());
+        // Seeking back into a finished one-shot replays it.
+        f.seek(0.5, 2.0); // → idx 1
+        assert!(!f.is_finished());
+        assert_eq!(f.tick(48_000.0), 0.2);
+        // Clamps past the end instead of overflowing the buffer.
+        f.seek(99.0, 2.0);
+        assert_eq!(f.tick(48_000.0), 0.4);
     }
 }

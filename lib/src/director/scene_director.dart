@@ -184,7 +184,11 @@ class SceneDirector {
   /// Returns the applied spec (for prompt-history caching), null on error.
   /// [capUserLen] enforces the 500-char user-prompt limit — refine() echoes
   /// the current spec back to the model and legitimately exceeds it.
-  Future<SceneSpec?> describe(String prompt, {bool capUserLen = true}) async {
+  Future<SceneSpec?> describe(
+    String prompt, {
+    bool capUserLen = true,
+    void Function(int chars)? onProgress,
+  }) async {
     if (_busy) {
       debugPrint('[director] busy — dropped prompt: "${prompt.trim()}"');
       onError('scene director is busy — wait for the current prompt');
@@ -199,7 +203,12 @@ class SceneDirector {
     debugPrint('[director] prompt: "$p"');
     _busy = true;
     try {
-      final raw = await llm.complete(_systemPrompt, p, jsonSchema: _specJsonSchema);
+      final raw = await llm.complete(
+        _systemPrompt,
+        p,
+        jsonSchema: _specJsonSchema,
+        onProgress: onProgress,
+      );
       SceneSpec spec;
       try {
         spec = parseSpec(raw);
@@ -209,6 +218,7 @@ class SceneDirector {
           _systemPrompt,
           '$p\n\n(previous output was invalid: ${e.message} — output the corrected JSON only)',
           jsonSchema: _specJsonSchema,
+          onProgress: onProgress,
         );
         spec = parseSpec(raw2);
       }
