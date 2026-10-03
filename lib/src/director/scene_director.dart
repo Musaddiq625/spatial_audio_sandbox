@@ -133,7 +133,7 @@ class SceneDirector {
     }
     _busy = true;
     try {
-      final raw = await llm.complete(_systemPrompt, p);
+      final raw = await llm.complete(_systemPrompt, p, jsonSchema: _specJsonSchema);
       SceneSpec spec;
       try {
         spec = parseSpec(raw);
@@ -142,6 +142,7 @@ class SceneDirector {
         final raw2 = await llm.complete(
           _systemPrompt,
           '$p\n\n(previous output was invalid: ${e.message} — output the corrected JSON only)',
+          jsonSchema: _specJsonSchema,
         );
         spec = parseSpec(raw2);
       }
@@ -302,15 +303,44 @@ class SceneDirector {
     return n.clamp(lo, hi);
   }
 
+  /// JSON schema for llama.cpp constrained decoding — the model cannot emit
+  /// a `kind` outside the enum or malformed structure. Range clamps in
+  /// [parseSpec] still apply for value sanity.
+  static const _specJsonSchema = {
+    'type': 'object',
+    'properties': {
+      'sources': {
+        'type': 'array',
+        'items': {
+          'type': 'object',
+          'properties': {
+            'name': {'type': 'string'},
+            'kind': {
+              'enum': ['bee', 'rain', 'pad', 'tone', 'noise'],
+            },
+            'az': {'type': 'number'},
+            'el': {'type': 'number'},
+            'dist': {'type': 'number'},
+            'gain': {'type': 'number'},
+            'motion': {'type': 'object'},
+          },
+          'required': ['name', 'kind', 'az', 'el', 'dist', 'gain'],
+        },
+      },
+    },
+    'required': ['sources'],
+  };
+
   static const _systemPrompt = '''
-You are the scene director for a binaural audio app. Turn the user's description into a JSON scene spec — output ONLY the JSON object, no prose, no markdown fences.
+You are the scene director for a binaural audio app. Turn the user's description into a JSON scene spec — output ONLY the JSON object, no prose.
 
-Schema:
-{"sources":[{"name":string,"kind":kind,"az":deg,"el":deg,"dist":m,"gain":0..1.5,"motion":{"orbit":{"radius":m,"period_s":s}|"approach":{"from_az":deg,"from_dist":m,"seconds":s}}}]}
+Kinds: bee (any buzzing insect — fly, mosquito, wasp), rain (steady hiss+droplets, good surround bed), pad (warm slow chord), tone (pure sine), noise (static/wind/ocean/waterfall texture). Map fanciful requests to the nearest kind ("ocean"→noise, "campfire"→noise, "meditation"→pad).
 
-Kinds (exact strings only): bee (buzzing insect, shines on close orbits), rain (steady hiss+droplets, good surround bed), pad (warm slow chord), tone (pure sine), noise (static/wind/ocean/waterfall texture).
+Coordinates: az=0 front, +90 left, -90 right, ±180 behind. el=+deg above the head plane. dist in meters (0.3 close-up … 30 far). Max 8 sources. Orbit periods ≥4s or the spatial image smears. Words like "behind"/"left"/"above" must be reflected in az/el.
 
-Coordinates: az=0 is directly in front, +90 left, -90 right, 180 behind. el=+deg above the head plane. dist in meters (0.3 close-up … 30 far). Max 8 sources. Keep motion periods ≥4s or the spatial image smears.
+Optional per-source motion: "motion":{"orbit":{"radius":m,"period_s":s}} for circling, or "motion":{"approach":{"from_az":deg,"from_dist":m,"seconds":s}} for a source flying toward the listener.
 
-Default missing fields sensibly (az 0, el 0, dist 1.5, gain 0.9). Map fanciful requests to the nearest kind ("ocean"→noise, "campfire"→noise, "meditation"→pad).''';
+Examples:
+"rain all around, bee circling close in front" → {"sources":[{"name":"rain","kind":"rain","az":0,"el":0,"dist":2.0,"gain":1.0},{"name":"bee","kind":"bee","az":0,"el":0.2,"dist":0.5,"gain":1.0,"motion":{"orbit":{"radius":0.5,"period_s":6}}}]}
+"wind howling behind me, a fly around my head" → {"sources":[{"name":"wind","kind":"noise","az":180,"el":0,"dist":8.0,"gain":0.8},{"name":"fly","kind":"bee","az":0,"el":0.2,"dist":0.5,"gain":1.0,"motion":{"orbit":{"radius":0.4,"period_s":5}}}]}''';
 }

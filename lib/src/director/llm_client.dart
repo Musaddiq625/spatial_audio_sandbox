@@ -13,7 +13,13 @@ class LlmClient {
   bool get configured => _endpoint.isNotEmpty;
 
   /// One chat completion; returns the assistant message content.
-  Future<String> complete(String system, String user) async {
+  /// [jsonSchema] enables llama.cpp constrained decoding — output is
+  /// guaranteed to match the schema at the token level.
+  Future<String> complete(
+    String system,
+    String user, {
+    Map<String, dynamic>? jsonSchema,
+  }) async {
     if (!configured) {
       throw StateError('LLM_ENDPOINT not set — run with --dart-define');
     }
@@ -28,6 +34,11 @@ class LlmClient {
             ],
             'temperature': 0.2,
             'max_tokens': 512,
+            if (jsonSchema != null)
+              'response_format': {
+                'type': 'json_object',
+                'schema': jsonSchema,
+              },
           }),
         )
         .timeout(_timeout);
