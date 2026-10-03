@@ -5,7 +5,7 @@ use anyhow::{anyhow, Result};
 use sas_engine::math::Vec3;
 use sas_engine::pose::{PoseSlot, PoseTracker};
 use sas_engine::rt::{Engine, EngineInfo};
-use sas_engine::source::SourceKind;
+use sas_engine::source::{FileSource, SourceKind};
 use sas_engine::render;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -177,6 +177,125 @@ pub fn remove_source(id: u32) {
             e.remove_source(id);
         }
     }
+}
+
+/// Play an audio file through the spatial pipeline. `bytes` is any
+/// container symphonia probes (mp3/wav); decoding happens here on the
+/// caller's thread — the audio callback only reads a mono buffer.
+pub fn add_file_source(
+    bytes: Vec<u8>,
+    looping: bool,
+    x: f32,
+    y: f32,
+    z: f32,
+    gain: f32,
+) -> Result<u32> {
+    let mut st = state().lock().map_err(|_| anyhow!("state poisoned"))?;
+    let sr = st
+        .engine
+        .as_ref()
+        .ok_or_else(|| anyhow!("engine not running"))?
+        .info
+        .sample_rate as f32;
+    let id = st.next_id;
+    st.next_id += 1;
+    let pcm = decode_to_mono(&bytes, sr)?;
+    st.engine
+        .as_mut()
+        .unwrap()
+        .add_custom(
+            Box::new(FileSource::new(pcm, looping)),
+            Vec3::new(x, y, z),
+            gain,
+            id,
+        )
+        .map_err(|e| anyhow!(e))?;
+    Ok(id)
+}
+
+/// Bytes (mp3/wav/…) → mono f32 at `dst_sr`, peak-normalized. Stereo is
+/// downmixed — direction comes from the engine, not the file.
+fn decode_to_mono(bytes: &[u8], dst_sr: f32) -> Result<Vec<f32>> {
+    use symphonia::core::audio::SampleBuffer;
+    use symphonia::core::codecs::DecoderOptions;
+    use symphonia::core::formats::FormatOptions;
+    use symphonia::core::io::MediaSourceStream;
+    use symphonia::core::meta::MetadataOptions;
+    use symphonia::core::probe::Hint;
+
+    let mss = MediaSourceStream::new(
+        Box::new(std::io::Cursor::new(bytes.to_vec())),
+        Default::default(),
+    );
+    let probed = symphonia::default::get_probe()
+        .format(&Hint::new(), mss, &FormatOptions::default(), &MetadataOptions::default())
+        .map_err(|e| anyhow!("unrecognized audio: {e}"))?;
+    let mut format = probed.format;
+    let track = format
+        .default_track()
+        .ok_or_else(|| anyhow!("no audio track"))?;
+    let src_sr = track
+        .codec_params
+        .sample_rate
+        .ok_or_else(|| anyhow!("unknown sample rate"))? as f32;
+    let track_id = track.id;
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .map_err(|e| anyhow!("decoder init: {e}"))?;
+
+    let mut mono = Vec::new();
+    while let Ok(packet) = format.next_packet() {
+        if packet.track_id() != track_id {
+            continue;
+        }
+        if let Ok(decoded) = decoder.decode(&packet) {
+            let spec = *decoded.spec();
+            let ch = spec.channels.count().max(1);
+            let mut buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+            buf.copy_interleaved_ref(decoded);
+            for frame in buf.samples().chunks(ch) {
+                let sum: f32 = frame.iter().sum();
+                mono.push(sum / ch as f32);
+            }
+        }
+    }
+    if mono.is_empty() {
+        return Err(anyhow!("decoded zero samples"));
+    }
+    let out = if (src_sr - dst_sr).abs() < 1.0 {
+        mono
+    } else {
+        resample_linear(&mono, src_sr, dst_sr)
+    };
+    Ok(normalize_peak(out, 0.8))
+}
+
+/// Linear interpolation — plenty for SFX/ambience; the spatial cues come
+/// from the HRTF stage, not source fidelity.
+fn resample_linear(src: &[f32], src_sr: f32, dst_sr: f32) -> Vec<f32> {
+    let step = src_sr / dst_sr;
+    let n = ((src.len() - 1) as f32 / step) as usize;
+    let mut out = Vec::with_capacity(n + 1);
+    for i in 0..=n {
+        let pos = i as f32 * step;
+        let i0 = pos.floor() as usize;
+        let frac = pos - i0 as f32;
+        let a = src[i0.min(src.len() - 1)];
+        let b = src[(i0 + 1).min(src.len() - 1)];
+        out.push(a + (b - a) * frac);
+    }
+    out
+}
+
+fn normalize_peak(mut buf: Vec<f32>, target: f32) -> Vec<f32> {
+    let peak = buf.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+    if peak > 1e-6 {
+        let g = target / peak;
+        for x in buf.iter_mut() {
+            *x *= g;
+        }
+    }
+    buf
 }
 
 /// S2 ear-test render: a source orbiting the head, written to a WAV file.

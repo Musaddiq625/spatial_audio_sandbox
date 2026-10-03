@@ -43,3 +43,6 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+
+# API keys (ElevenLabs etc.) — passed via --dart-define or sourced locally
+.env

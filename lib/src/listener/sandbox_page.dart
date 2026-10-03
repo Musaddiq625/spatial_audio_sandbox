@@ -1,9 +1,11 @@
 import 'dart:async';
 import 'dart:math' as math;
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:spatial_audio_sandbox/src/director/llm_client.dart';
 import 'package:spatial_audio_sandbox/src/director/scene_director.dart';
+import 'package:spatial_audio_sandbox/src/director/sfx_client.dart';
 import 'package:spatial_audio_sandbox/src/link/acoustic_bridge.dart';
 import 'package:spatial_audio_sandbox/src/listener/beacon_tracker.dart';
 import 'package:spatial_audio_sandbox/src/link/link.dart';
@@ -20,12 +22,21 @@ class SourceDot {
     required this.pos,
     this.gain = 1.0,
     this.z = 0,
-  });
+    String? label,
+  }) : label = label ?? kind.name;
   int id; // re-assigned when the engine restarts (old ids die with it)
   final SourceKindWire kind;
   Offset pos; // (front, left), meters
   double gain;
   double z; // up, meters
+  String label; // spec name or kind name — shown on the radar + chips
+
+  /// Decoded-clip bytes once SFX generation lands (the procedural `kind`
+  /// is only the stand-in). Kept so engine restarts re-add the file
+  /// source without another generation call.
+  Uint8List? fileBytes;
+  bool looping = true;
+  bool get isFile => fileBytes != null;
 }
 
 /// A sent prompt + the spec it generated — the chip replays the cached
@@ -111,10 +122,13 @@ class _SandboxPageState extends State<SandboxPage> {
     super.initState();
     _director = SceneDirector(
       llm: LlmClient(),
+      sfx: SfxClient(),
       onError: _toast,
       add: _directedAdd,
       remove: _directedRemove,
       setPos: _directedSetPos,
+      upgrade: _directedUpgrade,
+      onStatus: _sfxStatus,
     );
     _pose.start();
     _link.start();
@@ -317,13 +331,22 @@ class _SandboxPageState extends State<SandboxPage> {
       final info = await engineStart();
       // Fresh engine has no sources — re-add local dots and linked beacons.
       for (final s in _sources) {
-        s.id = await addSource(
-          kind: s.kind,
-          x: s.pos.dx,
-          y: s.pos.dy,
-          z: s.z,
-          gain: s.gain,
-        );
+        s.id = s.isFile
+            ? await addFileSource(
+                bytes: s.fileBytes!,
+                looping: s.looping,
+                x: s.pos.dx,
+                y: s.pos.dy,
+                z: s.z,
+                gain: s.gain,
+              )
+            : await addSource(
+                kind: s.kind,
+                x: s.pos.dx,
+                y: s.pos.dy,
+                z: s.z,
+                gain: s.gain,
+              );
       }
       for (final b in _beacons.values) {
         await _createBeaconSource(b);
@@ -383,8 +406,9 @@ class _SandboxPageState extends State<SandboxPage> {
     SourceKindWire kind,
     Offset pos,
     double z,
-    double gain,
-  ) async {
+    double gain, {
+    String? label,
+  }) async {
     if (!_engineOn) {
       _toast('start the engine first');
       return null;
@@ -397,12 +421,57 @@ class _SandboxPageState extends State<SandboxPage> {
         z: z,
         gain: gain,
       );
-      final dot = SourceDot(id: id, kind: kind, pos: pos, gain: gain, z: z);
+      final dot = SourceDot(
+        id: id,
+        kind: kind,
+        pos: pos,
+        gain: gain,
+        z: z,
+        label: label,
+      );
       setState(() => _sources.add(dot));
       return dot;
     } catch (e) {
       _toast('add source failed: $e');
       return null;
+    }
+  }
+
+  /// Stand-in → generated clip: same dot, new engine source. If the
+  /// engine is off, the bytes are stashed and the restart re-adds the
+  /// file source directly.
+  Future<void> _directedUpgrade(
+    Object key,
+    Uint8List bytes,
+    bool looping,
+  ) async {
+    final dot = key as SourceDot;
+    dot.fileBytes = bytes;
+    dot.looping = looping;
+    if (!_engineOn) return;
+    try {
+      removeSource(id: dot.id);
+      dot.id = await addFileSource(
+        bytes: bytes,
+        looping: looping,
+        x: dot.pos.dx,
+        y: dot.pos.dy,
+        z: dot.z,
+        gain: dot.gain,
+      );
+    } catch (e) {
+      _toast('file source failed: $e');
+    }
+  }
+
+  void _sfxStatus(String name, SfxStatus status) {
+    switch (status) {
+      case SfxStatus.generating:
+        break; // the prompt chip already spins
+      case SfxStatus.ready:
+        _toast('$name ready');
+      case SfxStatus.failed:
+        _toast('$name: generation failed');
     }
   }
 
@@ -888,7 +957,7 @@ class _SandboxPageState extends State<SandboxPage> {
                 for (final s in _sources)
                   InputChip(
                     label: Text(
-                      s.kind.name,
+                      s.label,
                       style: TextStyle(
                         fontSize: 12,
                         color: _kindColors[s.kind] ?? Colors.white,
@@ -1111,7 +1180,7 @@ class _RadarPainter extends CustomPainter {
       canvas.drawCircle(p, 6, Paint()..color = color);
       final tp = TextPainter(
         text: TextSpan(
-          text: s.kind.name,
+          text: s.label,
           style: TextStyle(fontSize: 9, color: color),
         ),
         textDirection: TextDirection.ltr,

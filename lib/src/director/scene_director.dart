@@ -1,11 +1,16 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
+import 'dart:typed_data';
 import 'dart:ui';
 
 import '../rust/api/engine.dart';
 import 'llm_client.dart';
 import 'motion.dart';
+import 'sfx_client.dart';
+
+/// Per-source SFX generation status, surfaced to the UI.
+enum SfxStatus { generating, ready, failed }
 
 /// A scene the director asked for: which sources, where, how they move.
 class SpecSource {
@@ -18,6 +23,10 @@ class SpecSource {
     this.gain = 0.9,
     this.orbit,
     this.approach,
+    this.traverse,
+    this.sound,
+    this.loop = true,
+    this.durationS = 6,
   });
 
   final String name;
@@ -28,6 +37,18 @@ class SpecSource {
   double gain;
   OrbitMotion? orbit;
   ApproachMotion? approach;
+  TraverseMotion? traverse;
+
+  /// Free-text audio description for the SFX generator. When set, the
+  /// procedural [kind] plays instantly as a stand-in and is swapped for
+  /// generated audio when the clip lands.
+  String? sound;
+
+  /// `loop:true` for continuous ambience beds; `false` for one-shot events.
+  bool loop;
+
+  /// Requested clip length — clamped to the SFX budget (≤12 s).
+  double durationS;
 
   /// Scene coords: +x front, +y left, +z up. Az 0 = front, +90 = left.
   Offset get pos2d {
@@ -53,6 +74,20 @@ class ApproachMotion {
   ApproachMotion({required this.fromAzDeg, required this.fromDistM, required this.seconds});
   double fromAzDeg;
   double fromDistM;
+  double seconds;
+}
+
+/// Linear az crossing at fixed distance — "a dragon going left to right".
+class TraverseMotion {
+  TraverseMotion({
+    required this.fromAzDeg,
+    required this.toAzDeg,
+    required this.distM,
+    required this.seconds,
+  });
+  double fromAzDeg;
+  double toAzDeg;
+  double distM;
   double seconds;
 }
 
@@ -96,17 +131,32 @@ class SceneDirector {
     required this.setPos,
     required this.onError,
     required this.llm,
+    this.sfx,
+    this.upgrade,
+    this.onStatus,
   });
 
-  /// (kind, x, y, z, gain) -> opaque page-side handle for the new source.
-  /// The handle must resolve the live engine id (ids are re-assigned on
-  /// engine restart). Returns null on failure.
+  /// (kind, x, y, z, gain, {label}) -> opaque page-side handle for the new
+  /// source. The handle must resolve the live engine id (ids are
+  /// re-assigned on engine restart). Returns null on failure.
   final Future<Object?> Function(
-      SourceKindWire kind, Offset pos, double z, double gain) add;
+      SourceKindWire kind, Offset pos, double z, double gain,
+      {String? label}) add;
   final void Function(Object key) remove;
   final void Function(Object key, Offset pos, double z) setPos;
   final void Function(String msg) onError;
   final LlmClient llm;
+
+  /// SFX generator — null or unconfigured means `sound` fields degrade to
+  /// procedural stand-ins (still spatialized).
+  final SfxClient? sfx;
+
+  /// Swap a directed source's audio for generated clip bytes — called
+  /// per-source as each generation lands.
+  final void Function(Object key, Uint8List bytes, bool looping)? upgrade;
+
+  /// Per-source generation status for the UI.
+  final void Function(String name, SfxStatus status)? onStatus;
 
   final _motion = MotionBank();
   final _owned = <Object>{};
@@ -178,18 +228,58 @@ class SceneDirector {
   Future<void> apply(SceneSpec spec) async {
     clear();
     _lastSpec = spec;
+    final wantSfx = spec.sources.any((s) => s.sound != null);
+    final sfxOk = wantSfx && (sfx?.configured ?? false);
+    if (wantSfx && !sfxOk) {
+      onError('ELEVENLABS_API_KEY not set — procedural stand-ins only');
+    }
     for (final s in spec.sources) {
       final start = s.approach != null
           ? Offset(
               s.approach!.fromDistM * math.cos(s.approach!.fromAzDeg * math.pi / 180),
               s.approach!.fromDistM * math.sin(s.approach!.fromAzDeg * math.pi / 180),
             )
-          : (s.orbit != null ? _orbitPos(s, 0) : s.pos2d);
-      final key = await add(s.kind, start, s.z, s.gain);
+          : s.traverse != null
+              ? _traversePos(s, 0)
+              : (s.orbit != null ? _orbitPos(s, 0) : s.pos2d);
+      final key = await add(s.kind, start, s.z, s.gain, label: s.name);
       if (key == null) continue;
       _owned.add(key);
       _byName[s.name] = key;
       _motion.track(DirectedSource(key: key, spec: s, setPos: setPos));
+      // Stand-in is already playing — the real clip upgrades it in flight.
+      if (s.sound != null && sfxOk) unawaited(_genFor(s, key));
+    }
+  }
+
+  /// Generate one source's clip, swap it in, and restart its motion so a
+  /// traverse/orbit begins as the real audio lands — not at apply time.
+  Future<void> _genFor(SpecSource s, Object key) async {
+    onStatus?.call(s.name, SfxStatus.generating);
+    try {
+      final bytes = await sfx!.generate(
+        s.sound!,
+        durationSeconds: s.durationS,
+        loop: s.loop,
+      );
+      if (!_owned.contains(key)) return; // scene was cleared mid-flight
+      upgrade?.call(key, bytes, s.loop);
+      _motion.restart(key);
+      onStatus?.call(s.name, SfxStatus.ready);
+      if (!s.loop) {
+        // One-shot: the engine self-removes the finished source — drop
+        // the dot shortly after playback ends.
+        final holdMs = (s.durationS * 1000).round() + 1500;
+        Future.delayed(Duration(milliseconds: holdMs), () {
+          if (_owned.remove(key)) {
+            _motion.untrack(key);
+            remove(key);
+          }
+        });
+      }
+    } catch (e) {
+      onStatus?.call(s.name, SfxStatus.failed);
+      onError('sfx ${s.name}: $e');
     }
   }
 
@@ -232,6 +322,14 @@ class SceneDirector {
     );
   }
 
+  Offset _traversePos(SpecSource s, double t) {
+    final tr = s.traverse!;
+    final k = (t / tr.seconds).clamp(0.0, 1.0);
+    final az =
+        (tr.fromAzDeg + (tr.toAzDeg - tr.fromAzDeg) * k) * math.pi / 180;
+    return Offset(tr.distM * math.cos(az), tr.distM * math.sin(az));
+  }
+
   static Map<String, Object?> _sourceJson(SpecSource s) => {
         'name': s.name,
         'kind': _kinds.entries.firstWhere((e) => e.value == s.kind).key,
@@ -239,9 +337,29 @@ class SceneDirector {
         'el': s.elDeg,
         'dist': s.distM,
         'gain': s.gain,
+        if (s.sound != null) 'sound': s.sound,
+        'loop': s.loop,
+        'duration_s': s.durationS,
         if (s.orbit != null)
           'motion': {
             'orbit': {'radius': s.orbit!.radiusM, 'period_s': s.orbit!.periodS}
+          }
+        else if (s.approach != null)
+          'motion': {
+            'approach': {
+              'from_az': s.approach!.fromAzDeg,
+              'from_dist': s.approach!.fromDistM,
+              'seconds': s.approach!.seconds
+            }
+          }
+        else if (s.traverse != null)
+          'motion': {
+            'traverse': {
+              'from_az': s.traverse!.fromAzDeg,
+              'to_az': s.traverse!.toAzDeg,
+              'dist': s.traverse!.distM,
+              'seconds': s.traverse!.seconds
+            }
           },
       };
 
@@ -287,6 +405,10 @@ class SceneDirector {
         distM: _clampNum(e['dist'], 0.3, 30, 1.5),
         gain: _clampNum(e['gain'], 0, 1.5, 0.9),
       );
+      final sound = (e['sound'] as String?)?.trim();
+      if (sound != null && sound.isNotEmpty) s.sound = sound;
+      if (e['loop'] is bool) s.loop = e['loop'] as bool;
+      s.durationS = _clampNum(e['duration_s'], 0.5, 12, 6);
       final motion = e['motion'];
       if (motion is Map) {
         final o = motion['orbit'];
@@ -303,6 +425,15 @@ class SceneDirector {
             fromAzDeg: _clampNum(a['from_az'], -180, 180, s.azDeg),
             fromDistM: _clampNum(a['from_dist'], 0.3, 30, 4),
             seconds: _clampNum(a['seconds'], 2, 30, 8),
+          );
+        }
+        final tr = motion['traverse'];
+        if (tr is Map) {
+          s.traverse = TraverseMotion(
+            fromAzDeg: _clampNum(tr['from_az'], -180, 180, s.azDeg),
+            toAzDeg: _clampNum(tr['to_az'], -180, 180, s.azDeg),
+            distM: _clampNum(tr['dist'], 0.3, 30, s.distM),
+            seconds: _clampNum(tr['seconds'], 2, 30, 8),
           );
         }
       }
@@ -335,6 +466,9 @@ class SceneDirector {
             'el': {'type': 'number'},
             'dist': {'type': 'number'},
             'gain': {'type': 'number'},
+            'sound': {'type': 'string'},
+            'loop': {'type': 'boolean'},
+            'duration_s': {'type': 'number'},
             'motion': {'type': 'object'},
           },
           'required': ['name', 'kind', 'az', 'el', 'dist', 'gain'],
@@ -351,9 +485,12 @@ Kinds: bee (any buzzing insect — fly, mosquito, wasp), rain (steady hiss+dropl
 
 Coordinates: az=0 front, +90 left, -90 right, ±180 behind. el=+deg above the head plane. dist in meters (0.3 close-up … 30 far). Max 8 sources. Orbit periods ≥4s or the spatial image smears. Words like "behind"/"left"/"above" must be reflected in az/el.
 
-Optional per-source motion: "motion":{"orbit":{"radius":m,"period_s":s}} for circling, or "motion":{"approach":{"from_az":deg,"from_dist":m,"seconds":s}} for a source flying toward the listener.
+Optional per-source motion: "motion":{"orbit":{"radius":m,"period_s":s}} for circling, "motion":{"approach":{"from_az":deg,"from_dist":m,"seconds":s}} for a source flying toward the listener, or "motion":{"traverse":{"from_az":deg,"to_az":deg,"dist":m,"seconds":s}} for a source crossing space (left→right, front→behind).
+
+For each real-world sound the user names, also set "sound": a short literal audio description for a sound-effects generator ("campfire crackling on dry wood", "children playing outdoors", "dragon roar with heavy wing beats"). Omit "sound" only for abstract requests. "loop":true for continuous ambience (beds, weather, crowds), false for one-shot events (a flyby, a roar, thunder). "duration_s": 4-10 for loops, 3-6 for one-shots.
 
 Examples:
-"rain all around, bee circling close in front" → {"sources":[{"name":"rain","kind":"rain","az":0,"el":0,"dist":2.0,"gain":1.0},{"name":"bee","kind":"bee","az":0,"el":0.2,"dist":0.5,"gain":1.0,"motion":{"orbit":{"radius":0.5,"period_s":6}}}]}
-"wind howling behind me, a fly around my head" → {"sources":[{"name":"wind","kind":"noise","az":180,"el":0,"dist":8.0,"gain":0.8},{"name":"fly","kind":"bee","az":0,"el":0.2,"dist":0.5,"gain":1.0,"motion":{"orbit":{"radius":0.4,"period_s":5}}}]}''';
+"rain all around, bee circling close in front" → {"sources":[{"name":"rain","kind":"rain","sound":"steady rain falling outdoors","loop":true,"duration_s":8,"az":0,"el":0,"dist":2.0,"gain":1.0},{"name":"bee","kind":"bee","sound":"bee buzzing","loop":true,"duration_s":6,"az":0,"el":0.2,"dist":0.5,"gain":1.0,"motion":{"orbit":{"radius":0.5,"period_s":6}}}]}
+"wind howling behind me, a fly around my head" → {"sources":[{"name":"wind","kind":"noise","sound":"cold wind howling","loop":true,"duration_s":8,"az":180,"el":0,"dist":8.0,"gain":0.8},{"name":"fly","kind":"bee","sound":"fly buzzing close","loop":true,"duration_s":6,"az":0,"el":0.2,"dist":0.5,"gain":1.0,"motion":{"orbit":{"radius":0.4,"period_s":5}}}]}
+"a dragon flying past me left to right, campfire in front" → {"sources":[{"name":"fire","kind":"noise","sound":"campfire crackling","loop":true,"duration_s":8,"az":0,"el":0,"dist":1.5,"gain":0.9},{"name":"dragon","kind":"noise","sound":"dragon roar with heavy wing beats","loop":false,"duration_s":6,"az":0,"el":10,"dist":2.5,"gain":1.0,"motion":{"traverse":{"from_az":-80,"to_az":80,"dist":2.5,"seconds":6}}}]}''';
 }

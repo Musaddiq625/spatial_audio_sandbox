@@ -6,7 +6,7 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `state`
+// These functions are ignored because they are not marked as `pub`: `decode_to_mono`, `normalize_peak`, `resample_linear`, `state`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `State`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `fmt`, `from`, `from`
 
@@ -78,6 +78,25 @@ void setSourceGain({required int id, required double gain}) =>
 
 Future<void> removeSource({required int id}) =>
     RustLib.instance.api.crateApiEngineRemoveSource(id: id);
+
+/// Play an audio file through the spatial pipeline. `bytes` is any
+/// container symphonia probes (mp3/wav); decoding happens here on the
+/// caller's thread — the audio callback only reads a mono buffer.
+Future<int> addFileSource({
+  required List<int> bytes,
+  required bool looping,
+  required double x,
+  required double y,
+  required double z,
+  required double gain,
+}) => RustLib.instance.api.crateApiEngineAddFileSource(
+  bytes: bytes,
+  looping: looping,
+  x: x,
+  y: y,
+  z: z,
+  gain: gain,
+);
 
 /// S2 ear-test render: a source orbiting the head, written to a WAV file.
 Future<void> renderOrbitWav({

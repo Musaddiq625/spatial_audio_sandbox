@@ -244,6 +244,45 @@ impl Source for Rain {
     }
 }
 
+/// Buffered playback source — decoded PCM from a file/API response.
+/// `looping` wraps at the end (use with seamless-loop content, e.g.
+/// ElevenLabs `loop:true` output); one-shots report `is_finished` and the
+/// mixer drops them on its own.
+pub struct FileSource {
+    buf: Vec<f32>,
+    idx: usize,
+    looping: bool,
+    done: bool,
+}
+
+impl FileSource {
+    pub fn new(buf: Vec<f32>, looping: bool) -> Self {
+        let done = buf.is_empty();
+        FileSource { buf, idx: 0, looping, done }
+    }
+}
+
+impl Source for FileSource {
+    fn tick(&mut self, _sr: f32) -> f32 {
+        if self.done {
+            return 0.0;
+        }
+        let x = self.buf[self.idx];
+        self.idx += 1;
+        if self.idx >= self.buf.len() {
+            if self.looping {
+                self.idx = 0;
+            } else {
+                self.done = true;
+            }
+        }
+        x
+    }
+    fn is_finished(&self) -> bool {
+        self.done
+    }
+}
+
 /// Pad: slow chord (A3 + C4 + E4) with staggered tremolo.
 pub struct Pad {
     phase: [f32; 3],
@@ -295,5 +334,20 @@ mod tests {
         assert_eq!(c.tick(48_000.0), 1.0);
         assert_eq!(c.tick(48_000.0), 0.0);
         assert!(c.is_finished());
+    }
+
+    #[test]
+    fn file_source_loops_and_finishes() {
+        let mut one = FileSource::new(vec![0.5; 4], false);
+        for _ in 0..4 {
+            assert_eq!(one.tick(48_000.0), 0.5);
+        }
+        assert!(one.is_finished());
+        assert_eq!(one.tick(48_000.0), 0.0);
+
+        let mut l = FileSource::new(vec![1.0, -1.0], true);
+        let got: Vec<f32> = (0..5).map(|_| l.tick(48_000.0)).collect();
+        assert_eq!(got, [1.0, -1.0, 1.0, -1.0, 1.0]);
+        assert!(!l.is_finished());
     }
 }

@@ -24,4 +24,4 @@ jobs:
           channel: stable
       - run: flutter pub get
       - run: flutter analyze --no-fatal-warnings # parked dead code stays visible but doesn't fail CI
-      - run: flutter test
+      - run: flutter test -j 1 # sequential — link_test/widget_test share UDP port 47290

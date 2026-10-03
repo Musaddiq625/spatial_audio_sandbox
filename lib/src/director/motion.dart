@@ -12,7 +12,7 @@ class DirectedSource {
   final Object key;
   final SpecSource spec;
   final void Function(Object key, Offset pos, double z) setPos;
-  final t0 = DateTime.now();
+  DateTime t0 = DateTime.now();
 }
 
 /// Drives moving sources: a ~30 Hz tick that evaluates each source's
@@ -33,6 +33,15 @@ class MotionBank {
     if (_entries.isEmpty) {
       _timer?.cancel();
       _timer = null;
+    }
+  }
+
+  /// Restart a source's motion clock — e.g. its generated clip just
+  /// landed, so a traverse should sweep from the start now, not from the
+  /// moment the spec was applied.
+  void restart(Object key) {
+    for (final e in _entries) {
+      if (e.key == key) e.t0 = DateTime.now();
     }
   }
 
@@ -59,6 +68,8 @@ class MotionBank {
         p = _orbit(s, dt);
       } else if (s.approach != null) {
         p = _approach(s, dt);
+      } else if (s.traverse != null) {
+        p = _traverse(s, dt);
       } else {
         continue; // static sources need no ticks
       }
@@ -84,5 +95,13 @@ class MotionBank {
     final az = fromAz + (toAz - fromAz) * k;
     final dist = a.fromDistM + (s.distM - a.fromDistM) * k;
     return Offset(dist * math.cos(az), dist * math.sin(az));
+  }
+
+  Offset _traverse(SpecSource s, double t) {
+    final tr = s.traverse!;
+    final k = (t / tr.seconds).clamp(0.0, 1.0);
+    final az =
+        (tr.fromAzDeg + (tr.toAzDeg - tr.fromAzDeg) * k) * math.pi / 180;
+    return Offset(tr.distM * math.cos(az), tr.distM * math.sin(az));
   }
 }

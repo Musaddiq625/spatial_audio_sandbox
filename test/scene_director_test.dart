@@ -76,4 +76,44 @@ void main() {
       expect(s.sources, isNotEmpty);
     }
   });
+
+  test('parses sound/loop/duration fields', () {
+    final s = SceneDirector.parseSpec('{"sources":['
+        '{"kind":"noise","sound":"campfire crackling","loop":true,"duration_s":8},'
+        '{"kind":"bee","sound":"dragon roar","loop":false,"duration_s":99}]}');
+    final fire = s.sources[0];
+    expect(fire.sound, 'campfire crackling');
+    expect(fire.loop, isTrue);
+    expect(fire.durationS, 8);
+    final dragon = s.sources[1];
+    expect(dragon.loop, isFalse);
+    expect(dragon.durationS, 12); // clamped to the SFX budget
+  });
+
+  test('defaults loop/duration when omitted', () {
+    final s = SceneDirector.parseSpec('{"sources":[{"kind":"rain"}]}');
+    expect(s.sources.single.loop, isTrue);
+    expect(s.sources.single.durationS, 6);
+    expect(s.sources.single.sound, isNull);
+  });
+
+  test('parses traverse motion', () {
+    final s = SceneDirector.parseSpec('{"sources":['
+        '{"kind":"noise","az":0,"motion":{"traverse":{"from_az":-80,"to_az":80,"dist":2.5,"seconds":6}}}]}');
+    final tr = s.sources.single.traverse!;
+    expect(tr.fromAzDeg, -80);
+    expect(tr.toAzDeg, 80);
+    expect(tr.distM, 2.5);
+    expect(tr.seconds, 6);
+  });
+
+  test('traverse clamps out-of-range values', () {
+    final s = SceneDirector.parseSpec('{"sources":['
+        '{"kind":"noise","motion":{"traverse":{"from_az":-400,"to_az":400,"dist":0.01,"seconds":99}}}]}');
+    final tr = s.sources.single.traverse!;
+    expect(tr.fromAzDeg, -180);
+    expect(tr.toAzDeg, 180);
+    expect(tr.distM, 0.3);
+    expect(tr.seconds, 30);
+  });
 }

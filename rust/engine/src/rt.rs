@@ -4,7 +4,7 @@
 use crate::math::Vec3;
 use crate::mix::Cmd;
 use crate::pose::PoseSlot;
-use crate::source::{self, SourceKind};
+use crate::source::{self, Source, SourceKind};
 use std::sync::Arc;
 
 #[derive(Clone, Debug)]
@@ -69,6 +69,14 @@ impl Engine {
     pub fn add_source(&mut self, kind: SourceKind, pos: Vec3, gain: f32, id: u32) -> Result<(), String> {
         self.cmd_tx
             .push(Cmd::Add { id, gen: source::make(kind), pos, gain })
+            .map_err(|_| "command queue full".to_string())
+    }
+
+    /// Any `Source` impl (e.g. decoded file playback) — same command path
+    /// as the procedural kinds.
+    pub fn add_custom(&mut self, gen: Box<dyn Source>, pos: Vec3, gain: f32, id: u32) -> Result<(), String> {
+        self.cmd_tx
+            .push(Cmd::Add { id, gen, pos, gain })
             .map_err(|_| "command queue full".to_string())
     }
 
