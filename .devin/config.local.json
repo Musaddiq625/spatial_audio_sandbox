@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Exec(git config)",
+      "Exec(git filter-repo)",
+      "Exec(git tag)",
+      "Exec(ls)"
+    ]
+  }
+}

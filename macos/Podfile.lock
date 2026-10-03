@@ -1,0 +1,22 @@
+PODS:
+  - FlutterMacOS (1.0.0)
+  - rust_lib_spatial_audio_sandbox (0.0.1):
+    - FlutterMacOS
+
+DEPENDENCIES:
+  - FlutterMacOS (from `Flutter/ephemeral`)
+  - rust_lib_spatial_audio_sandbox (from `Flutter/ephemeral/.symlinks/plugins/rust_lib_spatial_audio_sandbox/macos`)
+
+EXTERNAL SOURCES:
+  FlutterMacOS:
+    :path: Flutter/ephemeral
+  rust_lib_spatial_audio_sandbox:
+    :path: Flutter/ephemeral/.symlinks/plugins/rust_lib_spatial_audio_sandbox/macos
+
+SPEC CHECKSUMS:
+  FlutterMacOS: d0db08ddef1a9af05a5ec4b724367152bb0500b1
+  rust_lib_spatial_audio_sandbox: 9e59d654aa3f22e2df82e166376a3cd5f8bc50c9
+
+PODFILE CHECKSUM: 54d867c82ac51cbd61b565781b9fada492027009
+
+COCOAPODS: 1.16.2

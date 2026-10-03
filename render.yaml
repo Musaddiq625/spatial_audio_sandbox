@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: sas-llm
+    runtime: docker
+    rootDir: server
+    plan: standard # 2 GB — fits gemma-3-1b-it Q4 weights + ctx
+    healthCheckPath: /health
+    envVars:
+      - key: HF_TOKEN
+        sync: false # HuggingFace read token — set in Render dashboard
