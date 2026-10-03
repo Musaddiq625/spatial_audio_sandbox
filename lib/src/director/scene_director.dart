@@ -196,6 +196,7 @@ class SceneDirector {
       onError('keep it under 500 chars');
       return null;
     }
+    debugPrint('[director] prompt: "$p"');
     _busy = true;
     try {
       final raw = await llm.complete(_systemPrompt, p, jsonSchema: _specJsonSchema);
@@ -217,8 +218,10 @@ class SceneDirector {
       );
       return spec;
     } on SpecException catch (e) {
+      debugPrint('[director] spec rejected (after retry): ${e.message}');
       onError('director: ${e.message}');
-    } catch (e) {
+    } catch (e, st) {
+      debugPrint('[director] FAILED: $e\n$st');
       onError('director unreachable: $e');
     } finally {
       _busy = false;
@@ -231,7 +234,11 @@ class SceneDirector {
     try {
       await apply(parseSpec(json));
     } on SpecException catch (e) {
+      debugPrint('[director] applyJson rejected: ${e.message}');
       onError(e.message);
+    } catch (e) {
+      debugPrint('[director] applyJson FAILED: $e');
+      onError('apply failed: $e');
     }
   }
 

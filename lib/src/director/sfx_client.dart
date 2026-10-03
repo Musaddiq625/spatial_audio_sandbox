@@ -57,7 +57,11 @@ class SfxClient {
         debugPrint('[sfx] "$text": disk cache hit (${bytes.length}B)');
         return bytes;
       }
-    } catch (_) {/* fall through to the API */}
+    } catch (e) {
+      // A cached clip that can't be read falls through to the API —
+      // that silently spends credits, so it must be visible.
+      debugPrint('[sfx] "$text": disk cache read failed ($e) — hitting API');
+    }
 
     debugPrint('[sfx] "$text": calling ElevenLabs…');
     final res = await http

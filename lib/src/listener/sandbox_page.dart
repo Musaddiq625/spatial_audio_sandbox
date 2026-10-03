@@ -512,7 +512,15 @@ class _SandboxPageState extends State<SandboxPage> {
   // keep working after an engine restart re-assigns ids.
   void _directedSetPos(Object key, Offset pos, double z) {
     final dot = key as SourceDot;
-    setSourcePosition(id: dot.id, x: pos.dx, y: pos.dy, z: z);
+    if (_engineOn) {
+      try {
+        setSourcePosition(id: dot.id, x: pos.dx, y: pos.dy, z: z);
+      } catch (e) {
+        // Engine may have already dropped the source (one-shot finished
+        // between ticks) — keep the radar dot moving regardless.
+        debugPrint('[motion] ${dot.label}: setSourcePosition failed — $e');
+      }
+    }
     dot.pos = pos;
     dot.z = z;
     if (mounted) setState(() {});
@@ -535,7 +543,9 @@ class _SandboxPageState extends State<SandboxPage> {
         if (e != null && e.spec != null) _prompts.add(e);
       }
       if (mounted) setState(() {});
-    } catch (_) {/* corrupt history → start empty */}
+    } catch (e) {
+      debugPrint('[history] load failed, starting empty: $e');
+    }
   }
 
   Future<void> _savePrompts() async {

@@ -1,8 +1,19 @@
+import 'dart:ui';
+
 import 'package:flutter/material.dart';
 import 'package:spatial_audio_sandbox/src/rust/frb_generated.dart';
 import 'package:spatial_audio_sandbox/src/listener/sandbox_page.dart';
 
 Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  FlutterError.onError = (details) {
+    FlutterError.presentError(details);
+    debugPrint('[crash] ${details.exceptionAsString()}\n${details.stack}');
+  };
+  PlatformDispatcher.instance.onError = (error, stack) {
+    debugPrint('[crash] unhandled async: $error\n$stack');
+    return true;
+  };
   await RustLib.init();
   runApp(const SandboxApp());
 }
