@@ -1,3 +1,4 @@
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:flutter/material.dart';
@@ -112,6 +113,20 @@ void main() {
     final levels = LevelsModel()..update(0.4, 0.1, [11, 12], [0.9, 0.05]);
     paintRadar(sources: dots, levels: levels);
     expect(levels.sourceLevel(11), greaterThan(0));
+  });
+
+  test('ribbon wave speed follows directional loudness', () {
+    final m = LevelsModel();
+    for (var i = 0; i < 20; i++) {
+      m.update(0.3, 0.3, const [], const []);
+      m.updateRibbon([(math.pi / 2, 0.9)], 0.033); // loud on the left
+    }
+    final left = LevelsModel.ribbonBin(math.pi / 2);
+    final right = LevelsModel.ribbonBin(-math.pi / 2);
+    expect(m.ribbonEnergy[left], greaterThan(0.5));
+    expect(m.ribbonEnergy[right], lessThan(0.05));
+    // Phase advanced ~9x faster on the loud side.
+    expect(m.ribbonPhase[left], greaterThan(m.ribbonPhase[right] * 5));
   });
 
   test('LevelsModel ballistics: instant attack, smooth release, ILD', () {

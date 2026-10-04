@@ -16,7 +16,54 @@ class LevelsModel {
   /// poll are dropped so stale ids can't ghost a removed source.
   final _src = <int, double>{};
 
+  /// Per-azimuth surround field (bins span −π..π, 0 = front, +π/2 =
+  /// left — same convention as source positions). The radar paints it
+  /// as a rim ribbon: [ribbonEnergy] sets the bulge, [ribbonPhase]
+  /// drives a traveling wave whose speed follows local loudness —
+  /// loud side churns fast, silence sits perfectly still.
+  static const ribbonBins = 72;
+  final ribbonEnergy = List<double>.filled(ribbonBins, 0);
+  final ribbonPhase = List<double>.filled(ribbonBins, 0);
+
   double sourceLevel(int id) => _src[id] ?? 0;
+
+  /// Bin index for an azimuth (radians, atan2 frame: 0=front, +π/2=left).
+  static int ribbonBin(double az) {
+    var a = az;
+    while (a > math.pi) {
+      a -= 2 * math.pi;
+    }
+    while (a < -math.pi) {
+      a += 2 * math.pi;
+    }
+    return ((a + math.pi) / (2 * math.pi) * ribbonBins)
+        .floor()
+        .clamp(0, ribbonBins - 1);
+  }
+
+  /// Feed the directional field: [(azimuth, level)] per live source.
+  /// [dtS] is the real time since the last call — phase accumulates at
+  /// ~0.15 rad/s silent up to ~9 rad/s at full level, so the rim's wave
+  /// visibly races where sound is loud and freezes where there's none.
+  void updateRibbon(List<(double az, double level)> field, double dtS) {
+    const spread = 25.0 * math.pi / 180;
+    for (var i = 0; i < ribbonBins; i++) {
+      final az = -math.pi + (i + 0.5) * 2 * math.pi / ribbonBins;
+      var e = 0.0;
+      for (final (sAz, sLvl) in field) {
+        var d = az - sAz;
+        while (d > math.pi) {
+          d -= 2 * math.pi;
+        }
+        while (d < -math.pi) {
+          d += 2 * math.pi;
+        }
+        e += sLvl * math.exp(-(d * d) / (2 * spread * spread));
+      }
+      ribbonEnergy[i] = _smooth(ribbonEnergy[i], e.clamp(0.0, 1.0));
+      ribbonPhase[i] += dtS * (0.15 + 9 * ribbonEnergy[i]);
+    }
+  }
 
   /// Interaural level difference in dB — + means louder in the left ear.
   /// Computed on smoothed RMS, not the normalized display value.
@@ -49,6 +96,9 @@ class LevelsModel {
     _rRms = 0;
     _src.updateAll((_, v) => v * 0.85);
     _src.removeWhere((_, v) => v < 0.02);
+    for (var i = 0; i < ribbonBins; i++) {
+      ribbonEnergy[i] *= 0.85; // wave dies down — phases just freeze
+    }
   }
 
   // Attack = instant (peak-like feel), release ≈ 250 ms at 33 ms polls.

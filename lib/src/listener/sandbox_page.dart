@@ -511,9 +511,23 @@ class _SandboxPageState extends State<SandboxPage> {
       });
       // ~30 Hz level poll: reads the mixer's atomics (never the engine
       // mutex) and repaints just the radar.
+      var lastPoll = DateTime.now();
       _levelsTimer ??= Timer.periodic(const Duration(milliseconds: 33), (_) {
         final w = getLevels();
         _levels.update(w.left, w.right, w.sourceIds, w.sourceLevels);
+        final now = DateTime.now();
+        _levels.updateRibbon(
+          [
+            for (final s in _sources)
+              if (!s.pending && !s.ended && s.id != null)
+                (
+                  math.atan2(s.pos.dy, s.pos.dx),
+                  _levels.sourceLevel(s.id!),
+                ),
+          ],
+          now.difference(lastPoll).inMilliseconds / 1000,
+        );
+        lastPoll = now;
         _radarTick.value++;
       });
       _syncSeekTicker(); // file sources re-added — playheads ticking again
@@ -2391,35 +2405,28 @@ class RadarPainter extends CustomPainter {
     );
 
     // ── surround energy ribbon: the rim swells toward loud azimuths —
-    // a surround meter without per-direction bars. Each live source
-    // spreads its real level over ~±25°; overlapping directions merge
-    // into one bulge. Silent scene → nothing drawn.
+    // a surround meter without per-direction bars. LevelsModel carries
+    // the directional field + a phase accumulator per bin, so the rim's
+    // traveling wave visibly races where sound is loud and sits dead
+    // still where there's none. Silent scene → nothing drawn.
     if (lvl != null) {
-      const n = 72;
-      const spread = 25.0 * math.pi / 180;
       const baseR = 2.0;
+      final eB = lvl.ribbonEnergy, ph = lvl.ribbonPhase;
+      final n = LevelsModel.ribbonBins;
       final outer = <Offset>[];
       final dirs = <Offset>[];
       var eMax = 0.0;
       for (var i = 0; i <= n; i++) {
-        final az = i * 2 * math.pi / n - math.pi;
-        var e = 0.0;
-        for (final s in sources) {
-          if (s.pending || s.ended || s.id == null) continue;
-          final l = lvl.sourceLevel(s.id!);
-          if (l <= 0.01) continue;
-          var d = az - math.atan2(s.pos.dy, s.pos.dx);
-          while (d > math.pi) {
-            d -= 2 * math.pi;
-          }
-          while (d < -math.pi) {
-            d += 2 * math.pi;
-          }
-          e += l * math.exp(-(d * d) / (2 * spread * spread));
-        }
+        final bi = i % n; // last sample wraps to bin 0
+        final az = -math.pi + (i + 0.5) * 2 * math.pi / n;
+        final e = eB[bi];
         if (e > eMax) eMax = e;
-        final r = rMax + baseR + 8.0 * e.clamp(0.0, 1.0);
-        // Same mapping as dots: azimuth 0 (front) → screen up.
+        // Bulge by loudness + traveling wave (5 lobes, amplitude ∝
+        // local energy so quiet arcs don't wobble at all).
+        final r = rMax +
+            baseR +
+            8.0 * e +
+            2.5 * e * math.sin(5 * az - ph[bi]);
         dirs.add(Offset(-math.sin(az), -math.cos(az)));
         outer.add(center + dirs.last * r);
       }
