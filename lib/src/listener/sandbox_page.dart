@@ -1453,6 +1453,24 @@ class _SandboxPageState extends State<SandboxPage> {
           ),
         ],
       ),
+      // Pinned to the viewport bottom regardless of content length —
+      // it lives outside the scroll view so a short page still shows
+      // it and a long page never pushes it away.
+      bottomNavigationBar: const SafeArea(
+        top: false,
+        child: Padding(
+          padding: EdgeInsets.only(top: 2, bottom: 4),
+          child: Text(
+            'Built with ❤️\nby Musaddiq625',
+            textAlign: TextAlign.center,
+            style: TextStyle(
+              fontSize: 10,
+              color: Color(0xFF5A6470),
+              height: 1.3,
+            ),
+          ),
+        ),
+      ),
     );
   }
 
@@ -1929,20 +1947,6 @@ class _SandboxPageState extends State<SandboxPage> {
           for (final s
               in _sources.where((d) => d.isFile && d.estDurS <= 0))
             _seekRow(s),
-          const Padding(
-            padding: EdgeInsets.only(top: 10, bottom: 2),
-            child: Center(
-              child: Text(
-                'Built with ❤️\nby Musaddiq625',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  fontSize: 10,
-                  color: Color(0xFF5A6470),
-                  height: 1.3,
-                ),
-              ),
-            ),
-          ),
         ],
       ),
     );
