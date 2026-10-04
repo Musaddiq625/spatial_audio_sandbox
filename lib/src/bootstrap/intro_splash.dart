@@ -64,6 +64,7 @@ class _IntroSplashPageState extends State<IntroSplashPage>
           animation: _ctl,
           builder: (context, _) {
             return Column(
+              crossAxisAlignment: CrossAxisAlignment.center,
               children: [
                 const Spacer(flex: 3),
                 // Radar mark + expanding rings — the "sound around you"

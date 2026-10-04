@@ -63,6 +63,9 @@ flutter_launcher_icons:
   image_path: "assets/branding/icon_1024.png"
   adaptive_icon_background: "#0B0E14"
   adaptive_icon_foreground: "assets/branding/icon_foreground.png"
+  # Full-bleed disc — the launcher mask does the cropping, so the
+  # generator's default 16% inset would only shrink the mark.
+  adaptive_icon_foreground_inset: 0
   macos:
     generate: true
     image_path: "assets/branding/icon_1024.png"

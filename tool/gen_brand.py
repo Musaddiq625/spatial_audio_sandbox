@@ -43,23 +43,24 @@ def draw_mark(size, glyph_scale=1.0, opaque=False):
     def r(v):
         return v * g
 
-    # disc + rim
-    d.ellipse([c - r(380), c - r(380), c + r(380), c + r(380)], fill=DISC)
-    d.ellipse([c - r(392), c - r(392), c + r(392), c + r(392)],
-              outline=TEAL + (230,), width=int(r(14)))
+    # disc + rim — the disc sits just inside the canvas edge so the
+    # launcher mask crops it into a full-bleed circular tile.
+    d.ellipse([c - r(412), c - r(412), c + r(412), c + r(412)], fill=DISC)
+    d.ellipse([c - r(398), c - r(398), c + r(398), c + r(398)],
+              outline=TEAL + (255,), width=int(r(20)))
 
     # range rings
-    for rr, a in ((120, 60), (230, 48), (340, 40)):
+    for rr, a in ((130, 60), (250, 48), (356, 40)):
         d.ellipse([c - r(rr), c - r(rr), c + r(rr), c + r(rr)],
-                  outline=DIM + (a,), width=int(r(7)))
+                  outline=DIM + (a,), width=int(r(9)))
 
     # crosshair ticks (N/E/S/W), low alpha
     for ang in (0, 90, 180, 270):
-        x1 = c + r(120) * math.sin(math.radians(ang))
-        y1 = c - r(120) * math.cos(math.radians(ang))
-        x2 = c + r(330) * math.sin(math.radians(ang))
-        y2 = c - r(330) * math.cos(math.radians(ang))
-        d.line([x1, y1, x2, y2], fill=DIM + (36,), width=int(r(6)))
+        x1 = c + r(130) * math.sin(math.radians(ang))
+        y1 = c - r(130) * math.cos(math.radians(ang))
+        x2 = c + r(348) * math.sin(math.radians(ang))
+        y2 = c - r(348) * math.cos(math.radians(ang))
+        d.line([x1, y1, x2, y2], fill=DIM + (36,), width=int(r(8)))
 
     # FOV wedge pointing "up" (front) — soft directional glow, kept
     # subtle so the head dot stays dominant at launcher sizes.
@@ -98,7 +99,10 @@ def draw_mark(size, glyph_scale=1.0, opaque=False):
 
 
 def save(img, path, size):
+    from PIL import ImageFilter
     img = img.resize((size, size), Image.LANCZOS)
+    # mild unsharp — downscaling softens the thin ring strokes
+    img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=70))
     os.makedirs(os.path.dirname(path), exist_ok=True)
     img.save(path)
     print("wrote", os.path.relpath(path, ROOT))
@@ -107,10 +111,10 @@ def save(img, path, size):
 def main():
     out = os.path.join(ROOT, "assets", "branding")
     save(draw_mark(S, opaque=True), os.path.join(out, "icon_1024.png"), 1024)
-    # Android adaptive icons crop to a central circle ~66% of canvas —
-    # shrink the mark so nothing clips (the generator adds a further
-    # 16% inset on top of this scale).
-    save(draw_mark(S, glyph_scale=0.72),
+    # Adaptive foreground: full-bleed disc — the launcher mask crops it
+    # into a circular radar tile. All detail lives inside the 66% safe
+    # zone already (dots at r<=250, rings at <=356 of 512 half-canvas).
+    save(draw_mark(S, glyph_scale=1.0),
          os.path.join(out, "icon_foreground.png"), 1024)
     save(draw_mark(S), os.path.join(out, "brand_mark.png"), 720)
     save(draw_mark(S), os.path.join(
