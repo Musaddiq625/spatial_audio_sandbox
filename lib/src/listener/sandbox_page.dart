@@ -15,7 +15,9 @@ import 'package:spatial_audio_sandbox/src/listener/calibration_sheet.dart';
 import 'package:spatial_audio_sandbox/src/link/link.dart';
 import 'package:spatial_audio_sandbox/src/link/net_state.dart';
 import 'package:spatial_audio_sandbox/src/listener/levels.dart';
+import 'package:spatial_audio_sandbox/src/listener/pipeline_strip.dart';
 import 'package:spatial_audio_sandbox/src/listener/pose_channel.dart';
+import 'package:spatial_audio_sandbox/src/listener/scene_score.dart';
 import 'package:spatial_audio_sandbox/src/listener/source_style.dart';
 import 'package:spatial_audio_sandbox/src/rust/api/engine.dart';
 
@@ -1005,74 +1007,129 @@ class _SandboxPageState extends State<SandboxPage> {
     setState(() {});
   }
 
-  /// Master seekbar — one bar for the whole composed scene. Scrubs the
-  /// scene clock: every clip's playhead, pending schedule, and motion
-  /// anchor follows (delay_i), so "breeze at 2s, plane at 4s" replays
-  /// exactly as authored.
-  Widget _sceneRow() {
+  /// Scene score — one lane per authored source on the master clock,
+  /// doubling as the scrubber. Cues, loops, and authored end events are
+  /// drawn so the composition is visible without hearing it.
+  Widget _scoreSection() {
     final len = _sceneLen;
     final t = _scrubT ?? (len > 0 ? _sceneT % len : 0.0);
     final live = _engineOn && len > 0;
     return Padding(
       padding: const EdgeInsets.only(top: 6),
-      child: Row(
+      child: Column(
         children: [
-          const SizedBox(
-            width: 60,
-            child: Text(
-              'scene',
-              style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
-            ),
+          SceneScore(
+            lanes: _scoreLanes(),
+            lengthS: len,
+            positionS: t,
+            onScrubStart: live ? _scrubStart : null,
+            onScrubUpdate: live ? _scrubMove : null,
+            onScrubEnd: live ? _scrubEnd : null,
           ),
-          Expanded(
-            child: SizedBox(
-              height: 24,
-              child: SliderTheme(
-                data: SliderTheme.of(context).copyWith(
-                  trackHeight: 3,
-                  thumbShape: const RoundSliderThumbShape(
-                    enabledThumbRadius: 7,
-                  ),
-                  overlayShape: const RoundSliderOverlayShape(
-                    overlayRadius: 14,
-                  ),
+          Row(
+            children: [
+              IconButton(
+                padding: EdgeInsets.zero,
+                onPressed: () => setState(() => _repeat = !_repeat),
+                icon: Icon(
+                  _repeat ? Icons.repeat_on : Icons.repeat,
+                  size: 16,
                 ),
-                child: Slider(
-                  value: t.clamp(0.0, len > 0 ? len : 1),
-                  max: len > 0 ? len : 1,
-                  onChangeStart: live ? (_) => _scrubStart() : null,
-                  onChanged: live ? _scrubMove : null,
-                  onChangeEnd: live ? _scrubEnd : null,
+                color: _repeat
+                    ? Theme.of(context).colorScheme.primary
+                    : const Color(0xFF9AA4B2),
+                tooltip: _repeat ? 'scene repeats' : 'scene plays once',
+                visualDensity: VisualDensity.compact,
+              ),
+              const Spacer(),
+              Text(
+                '${t.toStringAsFixed(1)} / ${len.toStringAsFixed(1)}s',
+                style: const TextStyle(
+                  fontSize: 10,
+                  color: Color(0xFF9AA4B2),
+                  fontFamily: 'monospace',
                 ),
               ),
-            ),
-          ),
-          SizedBox(
-            width: 74,
-            child: Text(
-              '${t.toStringAsFixed(1)} / ${len.toStringAsFixed(1)}s',
-              style: const TextStyle(fontSize: 10, color: Color(0xFF9AA4B2)),
-              textAlign: TextAlign.right,
-            ),
-          ),
-          SizedBox(
-            width: 30,
-            height: 24,
-            child: IconButton(
-              padding: EdgeInsets.zero,
-              onPressed: () => setState(() => _repeat = !_repeat),
-              icon: Icon(
-                _repeat ? Icons.repeat_on : Icons.repeat,
-                size: 16,
-              ),
-              color: _repeat
-                  ? Theme.of(context).colorScheme.primary
-                  : const Color(0xFF9AA4B2),
-              tooltip: _repeat ? 'scene repeats' : 'scene plays once',
-              visualDensity: VisualDensity.compact,
-            ),
+            ],
           ),
         ],
+      ),
+    );
+  }
+
+  List<ScoreLane> _scoreLanes() => [
+        for (final s in _sources.where((d) => d.estDurS > 0))
+          () {
+            final style = styleFor(s.label, s.kind);
+            return ScoreLane(
+              name: s.label,
+              icon: style.icon,
+              color: style.color,
+              startS: s.delayS,
+              endS: s.endS ??
+                  (s.looping
+                      ? _sceneLen
+                      : math.min(s.delayS + s.estDurS, _sceneLen)),
+              loop: s.looping,
+              pending: s.pending,
+              ended: s.ended,
+              isFile: s.isFile,
+              endsWithEvent: s.endS != null,
+            );
+          }(),
+      ];
+
+  /// The spec JSON Gemma authored — the same object refine() echoes
+  /// back to the model, shown pretty-printed.
+  void _viewSpec() {
+    final spec = _director.lastSpec;
+    if (spec == null) return;
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF0A0E14),
+      builder: (ctx) => FractionallySizedBox(
+        heightFactor: 0.85,
+        child: SafeArea(
+          child: Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.all(12),
+                child: Row(
+                  children: [
+                    const Expanded(
+                      child: Text(
+                        'scene spec — what Gemma wrote',
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close),
+                      onPressed: () => Navigator.pop(ctx),
+                      visualDensity: VisualDensity.compact,
+                    ),
+                  ],
+                ),
+              ),
+              Expanded(
+                child: SingleChildScrollView(
+                  padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+                  child: SelectableText(
+                    specPrettyJson(spec),
+                    style: const TextStyle(
+                      fontSize: 11,
+                      fontFamily: 'monospace',
+                      color: Color(0xFF9AA4B2),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -1707,15 +1764,34 @@ class _SandboxPageState extends State<SandboxPage> {
               ),
             ],
           ),
-          if (_describing)
-            Padding(
-              padding: const EdgeInsets.only(top: 3, left: 2),
-              child: Text(
-                'Gemma… ${DateTime.now().difference(_describeStarted!).inSeconds}s'
-                '${_llmChars > 0 ? ' · receiving spec (${(_llmChars / 1000).toStringAsFixed(1)}k chars)' : ''}',
-                style: const TextStyle(fontSize: 10, color: Color(0xFF9AA4B2)),
-              ),
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: PipelineStrip(
+              describing: _describing,
+              describeSeconds: _describeStarted == null
+                  ? 0
+                  : DateTime.now()
+                          .difference(_describeStarted!)
+                          .inMilliseconds /
+                      1000,
+              llmChars: _llmChars,
+              specSeconds: _activePrompt?.specSeconds,
+              spec: _director.lastSpec,
+              prompt: _activePrompt?.prompt,
+              clipDone: _clipStatus.values
+                  .where((s) => s != SfxStatus.generating)
+                  .length,
+              clipTotal: _director.lastSpec?.sources
+                      .where((s) => s.sound != null)
+                      .length ??
+                  0,
+              clipGenerating: _clipStatus.values
+                  .any((s) => s == SfxStatus.generating),
+              engineOn: _engineOn,
+              sourceCount: _sources.length,
+              onViewSpec: _viewSpec,
             ),
+          ),
           Wrap(
             spacing: 6,
             crossAxisAlignment: WrapCrossAlignment.center,
@@ -1843,7 +1919,7 @@ class _SandboxPageState extends State<SandboxPage> {
                 ),
               ),
           ],
-          if (_sceneLen > 0) _sceneRow(),
+          if (_sceneLen > 0) _scoreSection(),
           // Per-clip bars only for sources outside the authored score —
           // scene sources are scrubbed by the master bar above.
           for (final s

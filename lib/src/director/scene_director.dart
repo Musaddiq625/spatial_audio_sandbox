@@ -124,6 +124,45 @@ class SceneSpec {
   /// Where the scene is set ("cave", "night market") — appended to
   /// generated sound prompts so clips match the environment.
   String? environment;
+
+  /// What the compiler had to do to the model's screenplay — surfaced
+  /// in the UI (pipeline strip) so repairs are visible, not just logs.
+  final report = CompileReport();
+}
+
+/// Compiler diagnostics for one spec: which model-emitted sources were
+/// dropped as ungrounded, which end events / transition one-shots were
+/// scheduled, whether the screenplay JSON needed truncation repair, and
+/// whether the zero-grounded keyword fallback fired.
+class CompileReport {
+  /// Names of sources dropped because nothing in the prompt named them.
+  final List<String> dropped = [];
+
+  /// "fire ends at 12s" — authored end events resolved to a source.
+  final List<String> ended = [];
+
+  /// "fire_end @ 12s" — transition one-shots inserted for end events.
+  final List<String> transitions = [];
+
+  /// The screenplay JSON was truncated mid-stream and repaired.
+  bool repaired = false;
+
+  /// Nothing grounded — the spec came from keyword fallback sources.
+  bool fallback = false;
+
+  /// One-line summary for the pipeline strip ("2 kept · 1 dropped ·
+  /// 1 transition"); null when the report carries nothing notable.
+  String? summary(int kept) {
+    final parts = <String>['$kept kept'];
+    if (dropped.isNotEmpty) parts.add('${dropped.length} dropped');
+    if (transitions.isNotEmpty) {
+      parts.add('${transitions.length} transition${transitions.length > 1 ? 's' : ''}');
+    }
+    if (ended.isNotEmpty) parts.add('${ended.length} end');
+    if (repaired) parts.add('repaired');
+    if (fallback) parts.add('fallback');
+    return parts.join(' · ');
+  }
 }
 
 class SpecException implements Exception {

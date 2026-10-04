@@ -318,6 +318,43 @@ void main() {
         '"start":"beginning","ends":"never","loop":true}]}');
     expect(byName(spec, 'fire')!.loop, isTrue);
   });
+
+  test('report records dropped sources and end transitions', () {
+    const prompt = 'a fire in front of me, and after a while the '
+        'fire goes out';
+    final spec = compile(prompt, '{"sources":['
+        '{"name":"fire","sound":"campfire crackling","role":"object",'
+        '"place":"front","distance":"near","movement":"still",'
+        '"start":"beginning","ends":"with_event","loop":true},'
+        '{"name":"dragon","sound":"dragon roar","role":"creature",'
+        '"place":"behind","distance":"far","movement":"still",'
+        '"start":"beginning","ends":"never","loop":true}]}');
+    expect(spec.report.dropped, contains('dragon'));
+    expect(spec.report.ended, isNotEmpty);
+    expect(spec.report.transitions, isNotEmpty);
+    expect(spec.report.fallback, isFalse);
+    expect(spec.report.repaired, isFalse);
+    expect(spec.report.summary(spec.sources.length), contains('dropped'));
+  });
+
+  test('report flags truncation repair and keyword fallback', () {
+    const prompt = 'rain around me';
+    // Truncated mid-second-source — the parser salvages the first.
+    final spec = compile(prompt, '{"sources":['
+        '{"name":"rain","sound":"steady rain","role":"weather",'
+        '"place":"around","distance":"close","movement":"still",'
+        '"start":"beginning","ends":"never","loop":true},'
+        '{"name":"wind","so');
+    expect(spec.report.repaired, isTrue);
+    expect(byName(spec, 'rain'), isNotNull);
+
+    final fb = compile(prompt, '{"sources":['
+        '{"name":"zebra","sound":"zebra sounds","role":"creature",'
+        '"place":"left","distance":"far","movement":"still",'
+        '"start":"beginning","ends":"never","loop":true}]}');
+    expect(fb.report.fallback, isTrue);
+    expect(fb.report.dropped, contains('zebra'));
+  });
 }
 
 bool _conceptsHit(SpecSource s, String word) =>

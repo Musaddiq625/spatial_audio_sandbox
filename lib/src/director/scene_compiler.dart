@@ -28,6 +28,9 @@ class ScreenplaySource {
 class Screenplay {
   String? environment;
   final sources = <ScreenplaySource>[];
+  /// True when the model's JSON was truncated mid-stream and repaired
+  /// by cutting at the last complete source — surfaced to the UI.
+  bool repaired = false;
 }
 
 /// Screenplay → compiled [SceneSpec]. Pure functions for testability.
@@ -208,10 +211,12 @@ class SceneCompiler {
     }
     Object? decoded;
     final slice = cleaned.substring(start, end + 1);
+    var repaired = false;
     try {
       decoded = jsonDecode(slice);
     } catch (_) {
       decoded = _repairedDecode(slice);
+      repaired = true;
     }
     if (decoded is! Map || decoded['sources'] is! List) {
       throw SpecException('missing "sources" array');
@@ -220,7 +225,7 @@ class SceneCompiler {
     if (list.isEmpty) throw SpecException('empty scene');
     if (list.length > 10) throw SpecException('too many sources (max 10)');
 
-    final sp = Screenplay();
+    final sp = Screenplay()..repaired = repaired;
     final env = decoded['environment'];
     if (env is String && env.trim().isNotEmpty) {
       sp.environment = env.trim();
@@ -499,7 +504,8 @@ class SceneCompiler {
       // itself usually states the setting, so recover it before
       // deciding the SFX text has no acoustic context.
       ..environment = sp.environment ??
-          _envWords.where((w) => _wordIn(w, promptL)).firstOrNull;
+          _envWords.where((w) => _wordIn(w, promptL)).firstOrNull
+      ..report.repaired = sp.repaired;
     final out = <SpecSource>[];
 
     // Timing words (or an end-event) make this a timed scene. Without
@@ -558,6 +564,7 @@ class SceneCompiler {
           extraGround.any((n) => _wordIn(n, '${s.name} ${s.sound}'.toLowerCase())) ||
           extraGround.any((n) => _sourceTokens(s).any((t) => _wordIn(t, n)));
       if (!grounded) {
+        spec.report.dropped.add(s.name);
         debugPrint('[compiler] dropped "${s.name}": not in prompt');
         continue;
       }
@@ -605,9 +612,11 @@ class SceneCompiler {
         final t = f.time;
         if (target != null) {
           target.endS = math.max(t, target.delayS + 1);
+          spec.report.ended.add('${target.name}@${target.endS}s');
           debugPrint('[compiler] ${target.name} ends at ${target.endS}s');
         }
         final name = target?.name ?? _nounBefore(subject);
+        spec.report.transitions.add('${name}_end@${t}s');
         out.add(SpecSource(
           name: '${name}_end',
           kind: SourceKindWire.noise,
@@ -627,6 +636,7 @@ class SceneCompiler {
     // Fallback: nothing grounded — build procedural sources from nouns
     // the prompt actually contains, so the scene isn't empty.
     if (out.isEmpty) {
+      spec.report.fallback = true;
       debugPrint('[compiler] zero grounded sources — keyword fallback');
       out.addAll(_fallbackSources(cls));
     }
