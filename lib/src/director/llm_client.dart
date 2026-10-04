@@ -1,8 +1,18 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+
+/// Transport failure — no route to the endpoint (offline, DNS, refused).
+/// Distinct from a stalled/slow generation so the UI can say "check
+/// your connection" instead of surfacing a raw socket error.
+class LlmOfflineException implements Exception {
+  const LlmOfflineException();
+  @override
+  String toString() => 'offline';
+}
 
 /// OpenAI-compatible chat client for the self-hosted llama.cpp endpoint.
 /// Endpoint is injected at build time:
@@ -56,9 +66,18 @@ class LlmClient {
           },
       });
 
-    final res = await http.Client()
-        .send(req)
-        .timeout(_connectTimeout); // headers — prompt eval follows
+    final http.StreamedResponse res;
+    try {
+      res = await http.Client()
+          .send(req)
+          .timeout(_connectTimeout); // headers — prompt eval follows
+    } on http.ClientException {
+      throw const LlmOfflineException();
+    } on SocketException {
+      throw const LlmOfflineException();
+    }
+    // TimeoutException on connect stays a timeout — a cold Render
+    // service also answers headers slowly; that isn't "offline".
     if (res.statusCode != 200) {
       final body = await res.stream.bytesToString();
       debugPrint('[llm] ← http ${res.statusCode}: $body');
@@ -97,6 +116,10 @@ class LlmClient {
     } on TimeoutException {
       debugPrint('[llm] stream stalled >${_stallTimeout.inSeconds}s after ${buf.length} chars');
       throw StateError('llm stream stalled (${buf.length} chars received)');
+    } on http.ClientException {
+      throw const LlmOfflineException(); // network dropped mid-stream
+    } on SocketException {
+      throw const LlmOfflineException();
     }
 
     final content = buf.toString();

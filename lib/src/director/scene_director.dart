@@ -322,6 +322,9 @@ class SceneDirector {
     } on SpecException catch (e) {
       debugPrint('[director] spec rejected (after retry): ${e.message}');
       onError('director: ${e.message}');
+    } on LlmOfflineException {
+      debugPrint('[director] LLM unreachable — offline');
+      onError('no internet — check your connection and retry');
     } catch (e, st) {
       debugPrint('[director] FAILED: $e\n$st');
       onError('director unreachable: $e');

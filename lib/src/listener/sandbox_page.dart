@@ -200,7 +200,6 @@ class _SandboxPageState extends State<SandboxPage> {
   // double _predictMs = 0;
   double _virtualYaw = 0; // radians, desktop fallback
   double _yawAtRecenter = 0;
-  bool _yawOnly = false; // head tracking mode: false = full 3D
   // Spatial tuning — must match the Rust mixer defaults.
   double _width = 1.3; // L/R separation exaggeration
   final double _wet = 0.08; // reverb send
@@ -464,7 +463,6 @@ class _SandboxPageState extends State<SandboxPage> {
       _applyRecenter(); // engine start = "forward is where I face now"
       // A fresh Mixer forgets tuning — re-send user prefs.
       setSpatialParams(width: _width, wet: _wet, ildDb: _ildDb);
-      setYawOnly(yawOnly: _yawOnly);
       // Fresh engine has no sources — re-add local dots and linked beacons.
       for (final s in _sources) {
         if (s.pending) continue; // not due — the ticker realizes it
@@ -758,8 +756,10 @@ class _SandboxPageState extends State<SandboxPage> {
   }
 
   void _syncSeekTicker() {
-    final active =
-        _engineOn && _sources.any((s) => s.isFile || s.needsSource);
+    // Ticks whenever a scene is on the clock — not just while sources
+    // are pending/failed. Otherwise the end-of-scene wrap check dies
+    // the moment all sources go live and repeat/off never fires.
+    final active = _engineOn && _sceneLen > 0;
     if (active) {
       _seekTicker ??= Timer.periodic(const Duration(milliseconds: 250), (_) {
         // No mid-drag or paused work: wraps and pending adds would
@@ -770,10 +770,11 @@ class _SandboxPageState extends State<SandboxPage> {
           if (_repeat) {
             _sceneSeek(_sceneT % len); // scene wraps — composition repeats
           } else {
-            // Repeat off: pin the clock at the end — the bar rests at
-            // len, beds keep sounding, one-shots don't refire.
+            // Repeat off: park the playhead at the end and pause —
+            // gains ramp to 0, motion freezes. Resume replays from 0.
             _sceneT0 = DateTime.now()
                 .subtract(Duration(milliseconds: (len * 1000).round()));
+            _pauseScene();
           }
         }
         _ensurePendingAdds();
@@ -917,12 +918,20 @@ class _SandboxPageState extends State<SandboxPage> {
   void _resumeScene() {
     final t = _pausedT;
     if (t == null) return;
+    // Resuming a scene paused at/after its end replays from the top —
+    // _sceneSeek(0) revives ended dots and re-dates every cue.
     _pausedT = null;
-    _sceneT0 = DateTime.now()
-        .subtract(Duration(milliseconds: (t * 1000).round()));
+    if (t >= _sceneLen && _sceneLen > 0) {
+      _sceneSeek(0);
+    } else {
+      _sceneT0 = DateTime.now()
+          .subtract(Duration(milliseconds: (t * 1000).round()));
+      if (_engineOn) {
+        _director.seekScene(t); // motion anchors follow the score, not
+        // wall time — without this a paused orbit would jump ahead.
+      }
+    }
     if (_engineOn) {
-      _director.seekScene(t); // motion anchors follow the score, not
-      // wall time — without this a paused orbit would jump ahead.
       _director.setMotionPaused(false);
       for (final dot in _sources) {
         final id = dot.id;
@@ -1083,61 +1092,6 @@ class _SandboxPageState extends State<SandboxPage> {
             );
           }(),
       ];
-
-  /// The spec JSON Gemma authored — the same object refine() echoes
-  /// back to the model, shown pretty-printed.
-  void _viewSpec() {
-    final spec = _director.lastSpec;
-    if (spec == null) return;
-    showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      backgroundColor: const Color(0xFF0A0E14),
-      builder: (ctx) => FractionallySizedBox(
-        heightFactor: 0.85,
-        child: SafeArea(
-          child: Column(
-            children: [
-              Padding(
-                padding: const EdgeInsets.all(12),
-                child: Row(
-                  children: [
-                    const Expanded(
-                      child: Text(
-                        'scene spec — what Gemma wrote',
-                        style: TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ),
-                    IconButton(
-                      icon: const Icon(Icons.close),
-                      onPressed: () => Navigator.pop(ctx),
-                      visualDensity: VisualDensity.compact,
-                    ),
-                  ],
-                ),
-              ),
-              Expanded(
-                child: SingleChildScrollView(
-                  padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
-                  child: SelectableText(
-                    specPrettyJson(spec),
-                    style: const TextStyle(
-                      fontSize: 11,
-                      fontFamily: 'monospace',
-                      color: Color(0xFF9AA4B2),
-                    ),
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
 
   Widget _seekRow(SourceDot d) {
     final pos = _filePos(d);
@@ -1456,24 +1410,6 @@ class _SandboxPageState extends State<SandboxPage> {
             onPressed: _openSoundCheck,
             icon: const Icon(Icons.hearing, size: 20),
           ),
-          IconButton(
-            tooltip: _yawOnly
-                ? 'head tracking: yaw only (tap for full 3D)'
-                : 'head tracking: full 3D (tap for yaw only)',
-            onPressed: () {
-              setState(() => _yawOnly = !_yawOnly);
-              setYawOnly(yawOnly: _yawOnly);
-            },
-            icon: Icon(
-              _yawOnly ? Icons.screen_rotation : Icons.threed_rotation,
-              size: 20,
-            ),
-          ),
-          IconButton(
-            tooltip: 'recenter head',
-            onPressed: _applyRecenter,
-            icon: const Icon(Icons.center_focus_strong, size: 20),
-          ),
           Padding(
             padding: const EdgeInsets.only(right: 8),
             child: FilledButton.tonalIcon(
@@ -1511,6 +1447,20 @@ class _SandboxPageState extends State<SandboxPage> {
           // scene's score + chips scroll instead of overflowing.
           Flexible(
             child: SingleChildScrollView(child: _controls()),
+          ),
+          const Padding(
+            padding: EdgeInsets.only(top: 2, bottom: 3),
+            child: Center(
+              child: Text(
+                'Built with ❤️\nby Musaddiq625',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 10,
+                  color: Color(0xFF5A6470),
+                  height: 1.3,
+                ),
+              ),
+            ),
           ),
         ],
       ),
@@ -1798,6 +1748,13 @@ class _SandboxPageState extends State<SandboxPage> {
               ),
             ],
           ),
+          const Padding(
+            padding: EdgeInsets.only(top: 4, left: 2),
+            child: Text(
+              'describe any scene — the AI builds it as 3D sound around you',
+              style: TextStyle(fontSize: 10, color: Color(0xFF5A6470)),
+            ),
+          ),
           Padding(
             padding: const EdgeInsets.only(top: 6),
             child: PipelineStrip(
@@ -1823,7 +1780,6 @@ class _SandboxPageState extends State<SandboxPage> {
                   .any((s) => s == SfxStatus.generating),
               engineOn: _engineOn,
               sourceCount: _sources.length,
-              onViewSpec: _viewSpec,
             ),
           ),
           Wrap(
@@ -1842,6 +1798,24 @@ class _SandboxPageState extends State<SandboxPage> {
                   ),
                   visualDensity: VisualDensity.compact,
                   onPressed: () => _director.applyJson(e.value),
+                ),
+            ],
+          ),
+          Wrap(
+            spacing: 6,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              const Text(
+                'add:',
+                style: TextStyle(fontSize: 10, color: Color(0xFF5A6470)),
+              ),
+              for (final k in SourceKindWire.values.where(
+                (k) => k != SourceKindWire.click,
+              ))
+                _KindChip(
+                  kind: k,
+                  color: _kindColors[k]!,
+                  onTap: () => _addSource(k),
                 ),
             ],
           ),
@@ -1960,20 +1934,6 @@ class _SandboxPageState extends State<SandboxPage> {
           for (final s
               in _sources.where((d) => d.isFile && d.estDurS <= 0))
             _seekRow(s),
-          const Padding(
-            padding: EdgeInsets.only(top: 10, bottom: 2),
-            child: Center(
-              child: Text(
-                'Built with ❤️\nby Musaddiq625',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  fontSize: 10,
-                  color: Color(0xFF5A6470),
-                  height: 1.3,
-                ),
-              ),
-            ),
-          ),
         ],
       ),
     );

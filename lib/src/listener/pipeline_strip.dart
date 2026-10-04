@@ -1,5 +1,3 @@
-import 'dart:convert';
-
 import 'package:flutter/material.dart';
 
 import '../director/scene_director.dart';
@@ -23,7 +21,6 @@ class PipelineStrip extends StatelessWidget {
     this.clipGenerating = false,
     required this.engineOn,
     required this.sourceCount,
-    this.onViewSpec,
   });
 
   final bool describing;
@@ -37,7 +34,6 @@ class PipelineStrip extends StatelessWidget {
   final bool clipGenerating;
   final bool engineOn;
   final int sourceCount;
-  final VoidCallback? onViewSpec;
 
   @override
   Widget build(BuildContext context) {
@@ -91,15 +87,6 @@ class PipelineStrip extends StatelessWidget {
         state: engineOn ? 'live · $sourceCount src' : 'off',
         tone: engineOn ? _Tone.done : _Tone.idle,
       ),
-      if (onViewSpec != null && spec != null)
-        IconButton(
-          key: const ValueKey('view_spec'),
-          tooltip: 'view spec JSON',
-          onPressed: onViewSpec,
-          icon: const Icon(Icons.data_object, size: 16),
-          visualDensity: VisualDensity.compact,
-          color: const Color(0xFF5A6470),
-        ),
     ];
 
     return Column(
@@ -127,10 +114,6 @@ class PipelineStrip extends StatelessWidget {
     final out = <Widget>[];
     for (var i = 0; i < stages.length; i++) {
       if (i > 0) {
-        if (stages[i] is IconButton) {
-          out.add(stages[i]);
-          continue;
-        }
         out.add(const Padding(
           padding: EdgeInsets.symmetric(horizontal: 1),
           child: Icon(Icons.chevron_right, size: 12, color: Color(0xFF3A4552)),
@@ -213,8 +196,3 @@ Widget _stage({
   );
 }
 
-/// Pretty-printed spec for the "view spec JSON" sheet — the exact JSON
-/// the compiler produced (what refine() echoes back to the model).
-String specPrettyJson(SceneSpec spec) =>
-    const JsonEncoder.withIndent('  ')
-        .convert(SceneDirector.specToJson(spec));
