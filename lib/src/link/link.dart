@@ -148,26 +148,49 @@ class SasLink {
   int rxCount = 0;
 
   Timer? _guardTimer;
+  bool _disposed = false;
+  Completer<void>? _bindRetry;
+  Timer? _bindRetryTimer;
 
   /// Bind the fixed link port, retrying briefly — socket close() releases
   /// the port asynchronously, so a fast restart can transiently collide.
-  static Future<RawDatagramSocket> _bindLinkPort() async {
+  /// The retry sleep is cancellable so dispose() can't leave a pending
+  /// timer behind (it flaked the widget tests).
+  Future<RawDatagramSocket> _bindLinkPort() async {
     Object? err;
     for (var i = 0; i < 20; i++) {
+      if (_disposed) throw StateError('link disposed');
       try {
         return await RawDatagramSocket.bind(InternetAddress.anyIPv4,
             kLinkPort,
             reuseAddress: true);
       } on SocketException catch (e) {
         err = e;
-        await Future.delayed(const Duration(milliseconds: 50));
+        _bindRetry = Completer<void>();
+        _bindRetryTimer = Timer(const Duration(milliseconds: 50), () {
+          _bindRetryTimer = null;
+          final c = _bindRetry;
+          _bindRetry = null;
+          c?.complete();
+        });
+        await _bindRetry!.future;
       }
     }
-    throw err!;
+    throw err ?? StateError('link disposed');
   }
 
   Future<void> start() async {
-    _sock ??= await _bindLinkPort();
+    if (_disposed) return;
+    try {
+      _sock ??= await _bindLinkPort();
+    } on StateError {
+      return; // disposed mid-bind
+    }
+    if (_disposed) {
+      _sock?.close();
+      _sock = null;
+      return;
+    }
     _sock!.listen(_onEvent, onError: (_) {});
     // A failed send (e.g. SASH reply to an unreachable beacon) can kill
     // the socket — the closed event triggers a rebind, and this guards
@@ -259,6 +282,13 @@ class SasLink {
   void markLinked(int beaconId) => linkedIds.add(beaconId);
 
   void dispose() {
+    _disposed = true;
+    // Wake an in-flight bind retry immediately — no pending Timer left.
+    _bindRetryTimer?.cancel();
+    _bindRetryTimer = null;
+    final c = _bindRetry;
+    _bindRetry = null;
+    c?.complete();
     _guardTimer?.cancel();
     _guardTimer = null;
     _sock?.close();

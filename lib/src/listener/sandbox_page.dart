@@ -5,6 +5,7 @@ import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:spatial_audio_sandbox/src/director/demo_pack.dart';
 import 'package:spatial_audio_sandbox/src/director/llm_client.dart';
 import 'package:spatial_audio_sandbox/src/director/scene_director.dart';
 import 'package:spatial_audio_sandbox/src/director/sfx_client.dart';
@@ -104,8 +105,12 @@ class SourceDot {
 /// spec without another model call. spec stays null while generating.
 /// Serializes for SharedPreferences so history survives restarts.
 class _PromptEntry {
-  _PromptEntry(this.prompt);
+  _PromptEntry(this.prompt, {this.recorded = false});
   final String prompt;
+
+  /// Bundled demo-pack entry — a recorded Gemma run. Shown labeled;
+  /// never persisted (it's already in the bundle).
+  final bool recorded;
   SceneSpec? spec;
   final startedAt = DateTime.now();
   double? specSeconds; // filled when the spec lands
@@ -119,7 +124,7 @@ class _PromptEntry {
     if (raw is! Map) return null;
     final prompt = raw['prompt'] as String?;
     if (prompt == null) return null;
-    final e = _PromptEntry(prompt);
+    final e = _PromptEntry(prompt, recorded: raw['recorded'] == true);
     final spec = raw['spec'];
     if (spec != null) {
       try {
@@ -1246,6 +1251,13 @@ class _SandboxPageState extends State<SandboxPage> {
         final e = _PromptEntry.fromJson(jsonDecode(s));
         if (e != null && e.spec != null) _prompts.add(e);
       }
+      // Bundled recorded runs always lead — instant keyless demos for
+      // anyone who installs the APK. Not persisted (they're in the
+      // bundle), immune to the history cap.
+      for (final d in demoScenes) {
+        final e = _PromptEntry.fromJson(d);
+        if (e != null && e.spec != null) _prompts.add(e);
+      }
       if (mounted) setState(() {});
     } catch (e) {
       debugPrint('[history] load failed, starting empty: $e');
@@ -1256,7 +1268,10 @@ class _SandboxPageState extends State<SandboxPage> {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setStringList(
       _historyKey,
-      _prompts.map((e) => jsonEncode(e.toJson())).toList(),
+      _prompts
+          .where((e) => !e.recorded)
+          .map((e) => jsonEncode(e.toJson()))
+          .toList(),
     );
   }
 
@@ -1275,9 +1290,10 @@ class _SandboxPageState extends State<SandboxPage> {
       _llmChars = 0;
       _prompts.add(entry);
       _selectedPrompt = entry; // the submitted prompt is selected
-      // FIFO cap — drop oldest completed entries.
-      while (_prompts.length > _historyCap) {
-        _prompts.removeAt(0);
+      // FIFO cap — drop oldest user entries; bundled demo scenes don't
+      // count against the cap.
+      while (_prompts.where((e) => !e.recorded).length > _historyCap) {
+        _prompts.removeAt(_prompts.indexWhere((e) => !e.recorded));
       }
     });
     // Engine spins up in parallel with Gemma's ~40 s think — the scene
@@ -1835,7 +1851,8 @@ class _SandboxPageState extends State<SandboxPage> {
                         DropdownMenuItem(
                           value: e,
                           child: Text(
-                            _promptLabel(e.prompt),
+                            '${e.recorded ? '[recorded] ' : ''}'
+                            '${_promptLabel(e.prompt)}',
                             style: const TextStyle(fontSize: 12),
                             overflow: TextOverflow.ellipsis,
                           ),
