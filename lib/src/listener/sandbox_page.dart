@@ -14,7 +14,9 @@ import 'package:spatial_audio_sandbox/src/listener/beacon_tracker.dart';
 import 'package:spatial_audio_sandbox/src/listener/calibration_sheet.dart';
 import 'package:spatial_audio_sandbox/src/link/link.dart';
 import 'package:spatial_audio_sandbox/src/link/net_state.dart';
+import 'package:spatial_audio_sandbox/src/listener/levels.dart';
 import 'package:spatial_audio_sandbox/src/listener/pose_channel.dart';
+import 'package:spatial_audio_sandbox/src/listener/source_style.dart';
 import 'package:spatial_audio_sandbox/src/rust/api/engine.dart';
 
 /// Scene-space position: `front` meters ahead (+x), `left` meters left (+y).
@@ -56,6 +58,15 @@ class SourceDot {
   bool adding = false; // async engine-add in flight — tick re-entry guard
   bool addFailed = false; // engine add threw — stops tick retries until
   // a scene seek or engine restart gives it a fresh attempt
+
+  /// Recent plan positions for the comet trail — pushed by
+  /// _directedSetPos / radar drags; the painter draws it faded.
+  final List<Offset> trail = [];
+  void pushTrail() {
+    trail.add(pos);
+    if (trail.length > 48) trail.removeAt(0);
+  }
+  void clearTrail() => trail.clear();
 
   /// Pending: authored dot with no live engine source yet (its cue
   /// hasn't arrived, or the scene was scrubbed back before it).
@@ -138,8 +149,8 @@ const _beaconKinds = [
 ];
 
 /// A remote beacon bound to an engine source — position arrives over UDP.
-class _BeaconState {
-  _BeaconState({required this.tracker});
+class BeaconState {
+  BeaconState({required this.tracker});
   final AimedBeaconTracker tracker;
   int? sourceId; // null until engine source is created
   SourceKindWire? kind; // decoded from telemetry flags
@@ -160,7 +171,7 @@ class _SandboxPageState extends State<SandboxPage> {
   final _pose = PoseBridge();
   final _sources = <SourceDot>[];
   final _link = SasLink();
-  final _beacons = <int, _BeaconState>{};
+  final _beacons = <int, BeaconState>{};
   final _announced = <int, BeaconAnnounce>{}; // seen but not bound yet
   final _net = NetMonitor();
   StreamSubscription<NetSnapshot>? _netSub;
@@ -195,8 +206,13 @@ class _SandboxPageState extends State<SandboxPage> {
   }
   int _nextPaletteIdx = 0;
   Timer? _statsTimer;
+  Timer? _levelsTimer;
   final _promptCtl = TextEditingController();
   late final SceneDirector _director;
+
+  /// Live stereo + per-source loudness polled from the mixer (~30 Hz)
+  /// — drives the ear meters, ILD readout, and reactive halos.
+  final _levels = LevelsModel();
 
   static const _rangeM = 5.0; // radar half-width in meters
 
@@ -241,6 +257,7 @@ class _SandboxPageState extends State<SandboxPage> {
   void dispose() {
     _statsTimer?.cancel();
     _seekTicker?.cancel();
+    _levelsTimer?.cancel();
     _describeTicker?.cancel();
     _pose.stop();
     _netSub?.cancel();
@@ -338,7 +355,7 @@ class _SandboxPageState extends State<SandboxPage> {
     final tracker = AimedBeaconTracker(headYawRad: () => _displayYaw);
     final b = _beacons.putIfAbsent(
       beaconId,
-      () => _BeaconState(tracker: tracker),
+      () => BeaconState(tracker: tracker),
     );
     b.name ??= ann?.name;
     if (ann?.apHost == true) b.apHost = true;
@@ -489,7 +506,7 @@ class _SandboxPageState extends State<SandboxPage> {
     }
   }
 
-  Future<void> _createBeaconSource(_BeaconState b) async {
+  Future<void> _createBeaconSource(BeaconState b) async {
     if (b.sourceId != null) return;
     final p = b.sample?.pos ?? const Offset(1.5, 0);
     try {
@@ -1136,6 +1153,7 @@ class _SandboxPageState extends State<SandboxPage> {
         debugPrint('[motion] ${dot.label}: setSourcePosition failed — $e');
       }
     }
+    dot.pushTrail();
     dot.pos = pos;
     dot.z = z;
     // Repaint only the radar — NOT the whole page. setState here ran
@@ -1343,6 +1361,12 @@ class _SandboxPageState extends State<SandboxPage> {
         ),
         actions: [
           IconButton(
+            tooltip: 'lab — dev controls',
+            key: KeyConstants.labButton,
+            onPressed: _openLab,
+            icon: const Icon(Icons.science_outlined, size: 20),
+          ),
+          IconButton(
             tooltip: 'sound check (L/R test)',
             key: KeyConstants.soundCheckButton,
             onPressed: _openSoundCheck,
@@ -1381,7 +1405,11 @@ class _SandboxPageState extends State<SandboxPage> {
           // _infoBar(),
           Expanded(child: _radar()),
           _legend(),
-          _controls(),
+          // Controls shrink-wrap but never crowd out the radar — a long
+          // scene's score + chips scroll instead of overflowing.
+          Flexible(
+            child: SingleChildScrollView(child: _controls()),
+          ),
         ],
       ),
     );
@@ -1389,7 +1417,7 @@ class _SandboxPageState extends State<SandboxPage> {
 
   /// One prominent card per linked beacon — identity + live telemetry +
   /// unlink, kept out of the scene/devices chip groups.
-  Widget _beaconCard(int id, _BeaconState b) {
+  Widget _beaconCard(int id, BeaconState b) {
     final s = b.sample;
     final stale = s?.stale ?? true;
     final accent = stale ? const Color(0xFF5A6470) : const Color(0xFF80DEEA);
@@ -1440,46 +1468,18 @@ class _SandboxPageState extends State<SandboxPage> {
     );
   }
 
-  Widget _sectionLabel(String t) => SizedBox(
-    width: double.infinity,
-    child: Padding(
-      padding: const EdgeInsets.only(top: 4, bottom: 2),
-      child: Text(
-        t,
-        style: const TextStyle(fontSize: 10, color: Color(0xFF5A6470)),
-      ),
-    ),
-  );
-
-  /// Visual language for the radar: solid dot = authored source, ringed
-  /// dot = real device tracked over UDP.
-  Widget _legend() => Padding(
-    padding: const EdgeInsets.fromLTRB(12, 0, 12, 2),
+  /// Visual key for the radar language — readable without sound.
+  Widget _legend() => const Padding(
+    padding: EdgeInsets.fromLTRB(12, 0, 12, 2),
     child: Row(
       children: [
-        Container(
-          width: 8,
-          height: 8,
-          decoration: const BoxDecoration(
-            color: Color(0xFF9AA4B2),
-            shape: BoxShape.circle,
-          ),
-        ),
-        const Text(
-          ' scene source',
+        Text(
+          'hollow = behind  ·  tail = motion  ·  stalk = height',
           style: TextStyle(fontSize: 10, color: Color(0xFF5A6470)),
         ),
-        const SizedBox(width: 14),
-        Container(
-          width: 8,
-          height: 8,
-          decoration: BoxDecoration(
-            shape: BoxShape.circle,
-            border: Border.all(color: const Color(0xFF80DEEA), width: 1.5),
-          ),
-        ),
-        const Text(
-          ' device',
+        Spacer(),
+        Text(
+          'L/R bars = real output',
           style: TextStyle(fontSize: 10, color: Color(0xFF5A6470)),
         ),
       ],
@@ -1544,23 +1544,33 @@ class _SandboxPageState extends State<SandboxPage> {
         final size = math.min(c.maxWidth, c.maxHeight);
         final scale = (size / 2 - 24) / _rangeM;
         return GestureDetector(
-          onPanStart: (d) => _dragTarget = _hitTest(
-            d.localPosition,
-            c.biggest.center(Offset.zero),
-            scale,
-          ),
+          onPanStart: (d) {
+            _dragTarget = _hitTest(
+              d.localPosition,
+              c.biggest.center(Offset.zero),
+              scale,
+            );
+            // Desktop only: dragging empty space turns the virtual head
+            // so world-locked sources stay put while you "look around".
+            _headDragging = _dragTarget == null && !_pose.isLive;
+          },
           onPanUpdate: (d) =>
               _onRadarDrag(d, c.biggest.center(Offset.zero), scale),
-          onPanEnd: (_) => _dragTarget = null,
+          onPanEnd: (_) {
+            _dragTarget = null;
+            _headDragging = false;
+          },
           onLongPressStart: (d) =>
               _onRadarLongPress(d, c.biggest.center(Offset.zero), scale),
           child: RepaintBoundary(
             child: CustomPaint(
-              painter: _RadarPainter(
+              painter: RadarPainter(
                 sources: _sources,
                 beacons: _beacons,
                 headYaw: _displayYaw,
                 rangeM: _rangeM,
+                sceneT: _sceneT,
+                levels: _levels,
                 repaint: _radarTick,
               ),
               child: const SizedBox.expand(),
@@ -1583,8 +1593,20 @@ class _SandboxPageState extends State<SandboxPage> {
   }
 
   SourceDot? _dragTarget;
+  bool _headDragging = false;
 
   void _onRadarDrag(DragUpdateDetails d, Offset center, double scale) {
+    if (_headDragging) {
+      // Turn the head toward the pointer: screen-up is yaw 0, left is
+      // + — same convention as the nose wedge. Recenter offset keeps
+      // the engine pose and the displayed heading in agreement.
+      final local = d.localPosition - center;
+      if (local.distance < 8) return; // dead zone — avoid flip jitter
+      _virtualYaw = math.atan2(-local.dx, -local.dy) + _yawAtRecenter;
+      _pose.useVirtualHead(_virtualYaw);
+      setState(() {});
+      return;
+    }
     final s = _dragTarget;
     if (s == null) return;
     final local = d.localPosition;
@@ -1592,6 +1614,7 @@ class _SandboxPageState extends State<SandboxPage> {
       -(local.dy - center.dy) / scale,
       -(local.dx - center.dx) / scale,
     );
+    s.pushTrail();
     setState(() => s.pos = scene);
     final id = s.id;
     if (id != null) {
@@ -1637,8 +1660,6 @@ class _SandboxPageState extends State<SandboxPage> {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          for (final e in _beacons.entries) _beaconCard(e.key, e.value),
-          _sectionLabel('scene director'),
           Row(
             children: [
               Expanded(
@@ -1686,7 +1707,12 @@ class _SandboxPageState extends State<SandboxPage> {
             ),
           Wrap(
             spacing: 6,
+            crossAxisAlignment: WrapCrossAlignment.center,
             children: [
+              const Text(
+                'try:',
+                style: TextStyle(fontSize: 10, color: Color(0xFF5A6470)),
+              ),
               for (final e in presetPrompts.entries)
                 ActionChip(
                   label: Text(
@@ -1812,211 +1838,173 @@ class _SandboxPageState extends State<SandboxPage> {
           for (final s
               in _sources.where((d) => d.isFile && d.estDurS <= 0))
             _seekRow(s),
-          _sectionLabel('Scenes:'),
-          const SizedBox(height: 6),
-          Wrap(
-            spacing: 6,
-            children: [
-              for (final k in SourceKindWire.values.where(
-                (k) => k != SourceKindWire.click,
-              ))
-                _KindChip(
-                  kind: k,
-                  color: _kindColors[k]!,
-                  onTap: () => _addSource(k),
+        ],
+      ),
+    );
+  }
+
+  /// Lab sheet: dev bench — manual sources, spatial tuning, beacon/link
+  /// controls. Everything a demo viewer doesn't need lives here.
+  Future<void> _openLab() {
+    return showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      builder: (_) => _LabView(page: this),
+    );
+  }
+}
+
+/// Dev-bench sheet content. Owns a slow tick so countdown labels inside
+/// the sheet stay fresh without rebuilding the page.
+class _LabView extends StatefulWidget {
+  const _LabView({required this.page});
+  final _SandboxPageState page;
+
+  @override
+  State<_LabView> createState() => _LabViewState();
+}
+
+class _LabViewState extends State<_LabView> {
+  Timer? _tick;
+
+  _SandboxPageState get page => widget.page;
+
+  @override
+  void initState() {
+    super.initState();
+    _tick = Timer.periodic(
+      const Duration(milliseconds: 500),
+      (_) => setState(() {}),
+    );
+  }
+
+  @override
+  void dispose() {
+    _tick?.cancel();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final page = widget.page;
+    return SafeArea(
+      key: KeyConstants.labSheet,
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Center(
+              child: Container(
+                width: 36,
+                height: 4,
+                margin: const EdgeInsets.only(bottom: 10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF3A4552),
+                  borderRadius: BorderRadius.circular(2),
                 ),
-              // TextButton(onPressed: _demoScene, child: const Text('demo scene')),
-            ],
-          ),
-          const SizedBox(height: 6),
-          if (_sources.isNotEmpty)
+              ),
+            ),
+            const Text(
+              'lab — dev controls',
+              style: TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 10),
+            _labLabel('add a source'),
             Wrap(
               spacing: 6,
               children: [
-                TextButton(
-                  onPressed: _clearAll,
-                  child: const Text('Clear All'),
-                ),
-                for (final s in _sources)
-                  InputChip(
-                    label: Text(
-                      s.ended
-                          ? '${s.label} · ended'
-                          : s.pending && s.dueAt != null
-                              ? '${s.label} · in ${math.max(0, (s.delayS - _sceneT).ceil())}s'
-                              : s.label,
-                      style: TextStyle(
-                        fontSize: 12,
-                        color: s.pending || s.ended
-                            ? (_kindColors[s.kind] ?? Colors.white)
-                                .withValues(alpha: 0.45)
-                            : _kindColors[s.kind] ?? Colors.white,
-                      ),
-                    ),
-                    avatar: switch (_clipStatus[s.label]) {
-                      SfxStatus.failed => const Icon(
-                          Icons.error_outline,
-                          size: 14,
-                          color: Color(0xFFE57373),
-                        ),
-                      SfxStatus.generating => const SizedBox(
-                          width: 12,
-                          height: 12,
-                          child: CircularProgressIndicator(strokeWidth: 2),
-                        ),
-                      _ => s.isFile
-                          ? const Icon(Icons.audio_file, size: 14)
-                          : null,
+                for (final k in SourceKindWire.values.where(
+                  (k) => k != SourceKindWire.click,
+                ))
+                  _KindChip(
+                    kind: k,
+                    color: _kindColors[k]!,
+                    onTap: () {
+                      page._addSource(k);
+                      setState(() {});
                     },
-                    deleteIcon: const Icon(Icons.close, size: 16),
-                    onDeleted: () => _removeSource(s),
-                    visualDensity: VisualDensity.compact,
-                  ),
-                // TextButton(onPressed: _demoScene, child: const Text('demo scene')),
-              ],
-            ),
-          if (_announced.isNotEmpty) ...[
-            _sectionLabel('devices'),
-            Wrap(
-              spacing: 6,
-              children: [
-                for (final a in _announced.values)
-                  ActionChip(
-                    label: Text(
-                      'link ${a.name ?? "beacon ${a.id}"}',
-                      style: const TextStyle(
-                        fontSize: 12,
-                        color: Color(0xFF80DEEA),
-                      ),
-                    ),
-                    onPressed: () => _linkBeacon(a.id),
                   ),
               ],
             ),
-          ],
-          if (_beacons.isNotEmpty)
-            Row(
-              children: [
-                const Text(
-                  'beacon dist',
-                  style: TextStyle(fontSize: 11, color: Color(0xFF9AA4B2)),
-                ),
-                if (_beacons.values.first.tracker.acousticM == null) ...[
-                  Expanded(
-                    child: Slider(
-                      value: _beacons.values.first.tracker.distanceM,
-                      min: 0.3,
-                      max: 8,
-                      label:
-                          '${_beacons.values.first.tracker.distanceM.toStringAsFixed(1)} m',
-                      onChanged: (v) => setState(
-                        () => _beacons.values.first.tracker.distanceM = v,
-                      ),
-                    ),
-                  ),
-                  SizedBox(
-                    width: 56,
-                    child: Text(
-                      '${_beacons.values.first.tracker.distanceM.toStringAsFixed(1)}m',
-                      style: const TextStyle(
-                        fontSize: 11,
-                        color: Color(0xFF9AA4B2),
-                      ),
-                    ),
-                  ),
-                ] else ...[
-                  Expanded(
-                    child: Text(
-                      'acoustic ${_beacons.values.first.tracker.acousticM!.toStringAsFixed(1)}m — live',
-                      style: const TextStyle(
-                        fontSize: 11,
-                        color: Color(0xFF80DEEA),
-                      ),
-                    ),
-                  ),
+            if (page._sources.isNotEmpty) ...[
+              _labLabel('live sources'),
+              Wrap(
+                spacing: 6,
+                children: [
                   TextButton(
-                    onPressed: () => setState(
-                      () => _beacons.values.first.tracker.clearAcoustic(),
+                    onPressed: () {
+                      page._clearAll();
+                      setState(() {});
+                    },
+                    child: const Text('Clear All'),
+                  ),
+                  for (final s in page._sources)
+                    InputChip(
+                      label: Text(
+                        s.ended
+                            ? '${s.label} · ended'
+                            : s.pending && s.dueAt != null
+                                ? '${s.label} · in ${math.max(0, (s.delayS - page._sceneT).ceil())}s'
+                                : s.label,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: s.pending || s.ended
+                              ? (_kindColors[s.kind] ?? Colors.white)
+                                  .withValues(alpha: 0.45)
+                              : _kindColors[s.kind] ?? Colors.white,
+                        ),
+                      ),
+                      avatar: switch (page._clipStatus[s.label]) {
+                        SfxStatus.failed => const Icon(
+                            Icons.error_outline,
+                            size: 14,
+                            color: Color(0xFFE57373),
+                          ),
+                        SfxStatus.generating => const SizedBox(
+                            width: 12,
+                            height: 12,
+                            child:
+                                CircularProgressIndicator(strokeWidth: 2),
+                          ),
+                        _ => s.isFile
+                            ? const Icon(Icons.audio_file, size: 14)
+                            : null,
+                      },
+                      deleteIcon: const Icon(Icons.close, size: 16),
+                      onDeleted: () {
+                        page._removeSource(s);
+                        setState(() {});
+                      },
+                      visualDensity: VisualDensity.compact,
                     ),
-                    child: const Text('manual'),
-                  ),
                 ],
-              ],
-            ),
-          // Row(
-          //   children: [
-          //     const Text('predict', style: TextStyle(fontSize: 11, color: Color(0xFF9AA4B2))),
-          //     Expanded(
-          //       child: Slider(
-          //         value: _predictMs,
-          //         max: 300,
-          //         divisions: 30,
-          //         label: '${_predictMs.round()} ms',
-          //         onChanged: (v) {
-          //           setState(() => _predictMs = v);
-          //           setPredictMs(ms: v);
-          //         },
-          //       ),
-          //     ),
-          //     SizedBox(
-          //       width: 56,
-          //       child: Text('${_predictMs.round()}ms', style: const TextStyle(fontSize: 11, color: Color(0xFF9AA4B2))),
-          //     ),
-          //   ],
-          // ),
-          Row(
-            children: [
-              const Text(
-                'width',
-                style: TextStyle(fontSize: 11, color: Color(0xFF9AA4B2)),
-              ),
-              Expanded(
-                child: Slider(
-                  value: _width,
-                  min: 0.5,
-                  max: 2.0,
-                  label: 'L/R ×${_width.toStringAsFixed(1)}',
-                  onChanged: (v) {
-                    setState(() => _width = v);
-                    _sendSpatial();
-                  },
-                ),
-              ),
-              SizedBox(
-                width: 56,
-                child: Text(
-                  '×${_width.toStringAsFixed(1)}',
-                  style: const TextStyle(
-                    fontSize: 11,
-                    color: Color(0xFF9AA4B2),
-                  ),
-                ),
               ),
             ],
-          ),
-          if (!_pose.isLive)
+            _labLabel('spatial tuning'),
             Row(
               children: [
                 const Text(
-                  'virtual head',
+                  'width',
                   style: TextStyle(fontSize: 11, color: Color(0xFF9AA4B2)),
                 ),
                 Expanded(
                   child: Slider(
-                    value: _virtualYaw,
-                    min: -math.pi,
-                    max: math.pi,
-                    label: '${(_virtualYaw * 180 / math.pi).round()}°',
+                    value: page._width,
+                    min: 0.5,
+                    max: 2.0,
+                    label: 'L/R ×${page._width.toStringAsFixed(1)}',
                     onChanged: (v) {
-                      setState(() => _virtualYaw = v);
-                      _pose.useVirtualHead(v);
+                      setState(() => page._width = v);
+                      page._sendSpatial();
                     },
                   ),
                 ),
                 SizedBox(
                   width: 56,
                   child: Text(
-                    '${(_virtualYaw * 180 / math.pi).round()}°',
+                    '×${page._width.toStringAsFixed(1)}',
                     style: const TextStyle(
                       fontSize: 11,
                       color: Color(0xFF9AA4B2),
@@ -2025,10 +2013,130 @@ class _SandboxPageState extends State<SandboxPage> {
                 ),
               ],
             ),
-        ],
+            if (!page._pose.isLive)
+              Row(
+                children: [
+                  const Text(
+                    'virtual head',
+                    style:
+                        TextStyle(fontSize: 11, color: Color(0xFF9AA4B2)),
+                  ),
+                  Expanded(
+                    child: Slider(
+                      value: page._virtualYaw,
+                      min: -math.pi,
+                      max: math.pi,
+                      label:
+                          '${(page._virtualYaw * 180 / math.pi).round()}°',
+                      onChanged: (v) {
+                        setState(() => page._virtualYaw = v);
+                        page._pose.useVirtualHead(v);
+                      },
+                    ),
+                  ),
+                  SizedBox(
+                    width: 56,
+                    child: Text(
+                      '${(page._virtualYaw * 180 / math.pi).round()}°',
+                      style: const TextStyle(
+                        fontSize: 11,
+                        color: Color(0xFF9AA4B2),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            if (page._announced.isNotEmpty) ...[
+              _labLabel('devices'),
+              Wrap(
+                spacing: 6,
+                children: [
+                  for (final a in page._announced.values)
+                    ActionChip(
+                      label: Text(
+                        'link ${a.name ?? "beacon ${a.id}"}',
+                        style: const TextStyle(
+                          fontSize: 12,
+                          color: Color(0xFF80DEEA),
+                        ),
+                      ),
+                      onPressed: () {
+                        page._linkBeacon(a.id);
+                        setState(() {});
+                      },
+                    ),
+                ],
+              ),
+            ],
+            for (final e in page._beacons.entries)
+              page._beaconCard(e.key, e.value),
+            if (page._beacons.isNotEmpty)
+              Row(
+                children: [
+                  const Text(
+                    'beacon dist',
+                    style:
+                        TextStyle(fontSize: 11, color: Color(0xFF9AA4B2)),
+                  ),
+                  if (page._beacons.values.first.tracker.acousticM ==
+                      null) ...[
+                    Expanded(
+                      child: Slider(
+                        value: page
+                            ._beacons.values.first.tracker.distanceM,
+                        min: 0.3,
+                        max: 8,
+                        label:
+                            '${page._beacons.values.first.tracker.distanceM.toStringAsFixed(1)} m',
+                        onChanged: (v) => setState(
+                          () => page._beacons.values.first.tracker
+                              .distanceM = v,
+                        ),
+                      ),
+                    ),
+                    SizedBox(
+                      width: 56,
+                      child: Text(
+                        '${page._beacons.values.first.tracker.distanceM.toStringAsFixed(1)}m',
+                        style: const TextStyle(
+                          fontSize: 11,
+                          color: Color(0xFF9AA4B2),
+                        ),
+                      ),
+                    ),
+                  ] else ...[
+                    Expanded(
+                      child: Text(
+                        'acoustic ${page._beacons.values.first.tracker.acousticM!.toStringAsFixed(1)}m — live',
+                        style: const TextStyle(
+                          fontSize: 11,
+                          color: Color(0xFF80DEEA),
+                        ),
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: () => setState(
+                        () => page._beacons.values.first.tracker
+                            .clearAcoustic(),
+                      ),
+                      child: const Text('manual'),
+                    ),
+                  ],
+                ],
+              ),
+          ],
+        ),
       ),
     );
   }
+
+  Widget _labLabel(String t) => Padding(
+        padding: const EdgeInsets.only(top: 10, bottom: 4),
+        child: Text(
+          t,
+          style: const TextStyle(fontSize: 10, color: Color(0xFF5A6470)),
+        ),
+      );
 }
 
 class _KindChip extends StatelessWidget {
@@ -2052,24 +2160,93 @@ class _KindChip extends StatelessWidget {
   }
 }
 
-class _RadarPainter extends CustomPainter {
-  _RadarPainter({
+/// The radar: top-down scene view. Front = up. Badges carry an icon +
+/// color per source (see source_style.dart), behind-you sources are
+/// hollow, elevated ones float on a stalk above their floor shadow,
+/// motion leaves a fading trail, halos breathe with the real output
+/// level, and L/R bars beside the head show the actual stereo bus.
+class RadarPainter extends CustomPainter {
+  RadarPainter({
     required this.sources,
     required this.beacons,
     required this.headYaw,
     required this.rangeM,
+    required this.sceneT,
+    this.levels,
     super.repaint,
   });
   final List<SourceDot> sources;
-  final Map<int, _BeaconState> beacons;
+  final Map<int, BeaconState> beacons;
   final double headYaw; // radians; >0 = turned left
   final double rangeM;
+  final double sceneT;
+  final LevelsModel? levels;
+
+  /// TextPainter layout is the painter's hot cost — cache by content.
+  static final _tpCache = <String, TextPainter>{};
+
+  static TextPainter _tp(String text, TextStyle style) {
+    final key = '$text|${style.hashCode}';
+    if (_tpCache.length > 256) _tpCache.clear();
+    return _tpCache.putIfAbsent(
+      key,
+      () => TextPainter(
+        text: TextSpan(text: text, style: style),
+        textDirection: TextDirection.ltr,
+      )..layout(),
+    );
+  }
+
+  static TextPainter _icon(IconData icon, double size, Color color) => _tp(
+        String.fromCharCode(icon.codePoint),
+        TextStyle(
+          fontSize: size,
+          fontFamily: icon.fontFamily,
+          package: icon.fontPackage,
+          color: color,
+        ),
+      );
+
+  /// Scene offset → canvas point, clamped to the edge ring so far
+  /// sources ride the rim instead of vanishing off-canvas.
+  static Offset _toCanvas(Offset scene, Offset center, double scale, double rMax) {
+    var v = Offset(-scene.dy * scale, -scene.dx * scale);
+    if (!v.dx.isFinite || !v.dy.isFinite) return center;
+    if (v.distance > rMax) v *= rMax / v.distance;
+    return center + v;
+  }
 
   @override
   void paint(Canvas canvas, Size size) {
     final center = size.center(Offset.zero);
-    final scale = (math.min(size.width, size.height) / 2 - 24) / rangeM;
+    final rMax = math.min(size.width, size.height) / 2 - 24;
+    final scale = rMax / rangeM;
+    final animT = DateTime.now().millisecondsSinceEpoch / 1000.0;
+    final lvl = levels;
 
+    // ── backdrop: dark disc + shaded front half ("in front" reads at
+    // a glance) + ±30° field-of-view cone.
+    canvas.drawCircle(center, rMax, Paint()..color = const Color(0xFF0B0F16));
+    canvas.drawArc(
+      Rect.fromCircle(center: center, radius: rMax),
+      math.pi,
+      math.pi,
+      false,
+      Paint()..color = const Color(0xFF4FC3F7).withValues(alpha: 0.045),
+    );
+    final fovPaint = Paint()
+      ..color = Colors.white.withValues(alpha: 0.06)
+      ..strokeWidth = 1;
+    for (final a in const [-30.0, 30.0]) {
+      final rad = (a - 90) * math.pi / 180;
+      canvas.drawLine(
+        center,
+        center + Offset(math.cos(rad), math.sin(rad)) * rMax,
+        fovPaint,
+      );
+    }
+
+    // ── rings with meter marks + crosshair axes.
     final ringPaint = Paint()
       ..color = const Color(0xFF26303C)
       ..style = PaintingStyle.stroke
@@ -2077,77 +2254,205 @@ class _RadarPainter extends CustomPainter {
     final axisPaint = Paint()
       ..color = const Color(0xFF1B222C)
       ..strokeWidth = 1;
-
     for (final r in [1.0, 2.0, 3.0, 4.0, 5.0]) {
       canvas.drawCircle(center, r * scale, ringPaint);
+      if (r < rangeM) {
+        _tp(
+          '${r.toInt()}m',
+          const TextStyle(fontSize: 8, color: Color(0xFF3A4552)),
+        ).paint(canvas, center + Offset(3, -r * scale - 3));
+      }
     }
     canvas.drawLine(
-      center + Offset(-rangeM * scale, 0),
-      center + Offset(rangeM * scale, 0),
+      center + Offset(-rMax, 0),
+      center + Offset(rMax, 0),
       axisPaint,
     );
     canvas.drawLine(
-      center + Offset(0, -rangeM * scale),
-      center + Offset(0, rangeM * scale),
+      center + Offset(0, -rMax),
+      center + Offset(0, rMax),
       axisPaint,
     );
 
-    // Heading wedge: headYaw>0 (turned left) => wedge sweeps left on screen.
-    final headPaint = Paint()..color = const Color(0xFF4CAF50);
-    final nose =
-        center + Offset(-math.sin(headYaw) * 20, -math.cos(headYaw) * 20);
-    final leftEar =
-        center +
-        Offset(-math.sin(headYaw + 2.5) * 10, -math.cos(headYaw + 2.5) * 10);
-    final rightEar =
-        center +
-        Offset(-math.sin(headYaw - 2.5) * 10, -math.cos(headYaw - 2.5) * 10);
-    canvas.drawPath(
-      Path()..addPolygon([nose, leftEar, rightEar], true),
-      headPaint,
+    // ── compass + heading readout.
+    const compassStyle = TextStyle(
+      fontSize: 9,
+      color: Color(0xFF5A6470),
+      fontWeight: FontWeight.w600,
+      letterSpacing: 1.2,
     );
-    canvas.drawCircle(center, 5, Paint()..color = const Color(0xFF4CAF50));
+    _tp('FRONT', compassStyle)
+        .paint(canvas, center + Offset(-16, -rMax - 15));
+    _tp('BEHIND', compassStyle)
+        .paint(canvas, center + Offset(-19, rMax + 5));
+    _tp('L', compassStyle).paint(canvas, center + Offset(-rMax - 13, -5));
+    _tp('R', compassStyle).paint(canvas, center + Offset(rMax + 7, -5));
+    var deg = (headYaw * 180 / math.pi) % 360;
+    if (deg > 180) deg -= 360;
+    if (deg < -180) deg += 360;
+    _tp(
+      'hdg ${deg.round()}°',
+      const TextStyle(
+        fontSize: 10,
+        color: Color(0xFF5A6470),
+        fontFamily: 'monospace',
+      ),
+    ).paint(canvas, const Offset(8, 6));
 
-    // Sources. Dots beyond the range ring clamp to the edge (like
-    // beacons) instead of vanishing off-canvas.
+    // ── sources: trail → guide line → stalk/shadow → badge → label.
     for (final s in sources) {
-      var v = Offset(-s.pos.dy * scale, -s.pos.dx * scale);
-      if (v.distance > rangeM * scale) {
-        v *= rangeM * scale / v.distance;
-      }
-      final p = center + v;
-      final color = _kindColors[s.kind] ?? Colors.white;
+      final p = _toCanvas(s.pos, center, scale, rMax);
+      final style = styleFor(s.label, s.kind);
       // Pending sources (cue hasn't arrived) and ended ones paint
       // dimmed — the composed plan is visible before and after it
       // sounds.
       final a = s.pending || s.ended ? 0.35 : 1.0;
-      canvas.drawCircle(
-        p,
-        10,
-        Paint()..color = color.withValues(alpha: 0.25 * a),
+      final srcLvl =
+          (s.id == null ? 0.0 : (lvl?.sourceLevel(s.id!) ?? 0.0)) * a;
+
+      final tr = s.trail;
+      if (tr.length > 1 && !s.ended) {
+        for (var i = 1; i < tr.length; i++) {
+          final p0 = _toCanvas(tr[i - 1], center, scale, rMax);
+          final p1 = _toCanvas(tr[i], center, scale, rMax);
+          canvas.drawLine(
+            p0,
+            p1,
+            Paint()
+              ..color = style.color
+                  .withValues(alpha: (0.04 + 0.30 * (i / tr.length)) * a)
+              ..strokeWidth = 1.5
+              ..strokeCap = StrokeCap.round,
+          );
+        }
+      }
+
+      if (!s.pending && !s.ended && s.id != null) {
+        canvas.drawLine(
+          center,
+          p,
+          Paint()
+            ..color = style.color.withValues(alpha: 0.06 + 0.16 * srcLvl)
+            ..strokeWidth = 1,
+        );
+      }
+
+      // Elevation: the badge floats on a stalk above its floor shadow —
+      // the shadow stays at the true plan position.
+      final zPx = (s.z * scale * 0.55).clamp(-rMax * 0.4, rMax * 0.4);
+      final elevated = zPx.abs() > 3;
+      final badgeP = p - Offset(0, zPx);
+      if (elevated) {
+        canvas.drawOval(
+          Rect.fromCenter(center: p, width: 18, height: 6),
+          Paint()..color = Colors.black.withValues(alpha: 0.5 * a),
+        );
+        canvas.drawLine(
+          p,
+          badgeP,
+          Paint()
+            ..color = style.color.withValues(alpha: 0.5 * a)
+            ..strokeWidth = 1,
+        );
+      }
+
+      // Halo breathes with the source's real output level; above ~0.3 a
+      // ripple ring expands out of the badge.
+      if (srcLvl > 0.02) {
+        canvas.drawCircle(
+          badgeP,
+          11 + 15 * srcLvl,
+          Paint()..color = style.color.withValues(alpha: 0.20 * srcLvl),
+        );
+        if (srcLvl > 0.3) {
+          final ph = (animT * 1.1) % 1.0;
+          canvas.drawCircle(
+            badgeP,
+            12 + ph * 14,
+            Paint()
+              ..color = style.color.withValues(alpha: (1 - ph) * 0.35)
+              ..style = PaintingStyle.stroke
+              ..strokeWidth = 1.2,
+          );
+        }
+      } else {
+        canvas.drawCircle(
+          badgeP,
+          11,
+          Paint()..color = style.color.withValues(alpha: 0.12 * a),
+        );
+      }
+
+      // Badge body: filled in front of the listener, hollow ring behind
+      // — the "behind you" cue survives even in a static screenshot.
+      final behind = s.pos.dx < 0;
+      if (behind) {
+        canvas.drawCircle(
+          badgeP,
+          9.5,
+          Paint()..color = const Color(0xFF0B0F16).withValues(alpha: a),
+        );
+        canvas.drawCircle(
+          badgeP,
+          9.5,
+          Paint()
+            ..color = style.color.withValues(alpha: a)
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 1.6,
+        );
+      } else {
+        canvas.drawCircle(
+          badgeP,
+          10,
+          Paint()..color = style.color.withValues(alpha: 0.9 * a),
+        );
+      }
+      final iconTp = _icon(
+        style.icon,
+        11,
+        behind
+            ? style.color.withValues(alpha: a)
+            : const Color(0xFF0B0F16).withValues(alpha: 0.95 * a),
       );
-      canvas.drawCircle(p, 6, Paint()..color = color.withValues(alpha: a));
-      final tp = TextPainter(
-        text: TextSpan(
-          text: s.label,
-          style: TextStyle(fontSize: 9, color: color.withValues(alpha: a)),
+      iconTp.paint(
+        canvas,
+        badgeP - Offset(iconTp.width / 2, iconTp.height / 2),
+      );
+
+      // Label: name · distance, plus countdown / ended / height.
+      var text = '${s.label} · ${s.pos.distance.toStringAsFixed(1)}m';
+      if (s.pending) {
+        text =
+            '${s.label} · in ${math.max(0, (s.delayS - sceneT)).ceil()}s';
+      } else if (s.ended) {
+        text = '${s.label} · ended';
+      }
+      if (elevated) {
+        text += s.z >= 0
+            ? ' ↑${s.z.toStringAsFixed(1)}m'
+            : ' ↓${(-s.z).toStringAsFixed(1)}m';
+      }
+      final lt = _tp(
+        text,
+        TextStyle(
+          fontSize: 10,
+          fontWeight: FontWeight.w600,
+          color: style.color.withValues(alpha: a),
         ),
-        textDirection: TextDirection.ltr,
-      )..layout();
-      tp.paint(canvas, p + const Offset(-14, 10));
+      );
+      final lp = badgeP + Offset(-lt.width / 2, elevated ? -26 : 12);
+      lt.paint(
+        canvas,
+        Offset(lp.dx.clamp(4.0, size.width - lt.width - 4), lp.dy),
+      );
     }
 
-    // Beacons: ringed dot + telemetry label, gray when stale. Dots beyond
-    // the radar range ride the edge ring instead of vanishing off-canvas.
+    // ── beacons: ringed dot + telemetry label, gray when stale.
     for (final b in beacons.values) {
       final s = b.sample;
       if (s == null) continue;
       final stale = s.stale;
-      var v = Offset(-s.pos.dy * scale, -s.pos.dx * scale);
-      if (v.distance > rangeM * scale) {
-        v *= rangeM * scale / v.distance;
-      }
-      final p = center + v;
+      final p = _toCanvas(s.pos, center, scale, rMax);
       final color = stale
           ? const Color(0xFF5A6470)
           : (_kindColors[b.kind] ?? const Color(0xFF80DEEA));
@@ -2162,17 +2467,94 @@ class _RadarPainter extends CustomPainter {
       canvas.drawCircle(p, 6, Paint()..color = color);
       final label =
           '${b.name ?? b.kind?.name ?? "beacon"} ${s.mode} ${s.distanceM.toStringAsFixed(1)}m';
-      final btp = TextPainter(
-        text: TextSpan(
-          text: label,
-          style: TextStyle(fontSize: 9, color: color),
-        ),
-        textDirection: TextDirection.ltr,
-      )..layout();
-      btp.paint(canvas, p + const Offset(-18, 14));
+      _tp(label, TextStyle(fontSize: 9, color: color))
+          .paint(canvas, p + const Offset(-18, 14));
+    }
+
+    // ── head wedge on top of sources; ears glow with real channel levels.
+    final eL = lvl?.left ?? 0;
+    final eR = lvl?.right ?? 0;
+    final headPaint = Paint()..color = const Color(0xFF4CAF50);
+    final nose =
+        center + Offset(-math.sin(headYaw) * 20, -math.cos(headYaw) * 20);
+    final leftEar = center +
+        Offset(-math.sin(headYaw + 2.5) * 10, -math.cos(headYaw + 2.5) * 10);
+    final rightEar = center +
+        Offset(-math.sin(headYaw - 2.5) * 10, -math.cos(headYaw - 2.5) * 10);
+    canvas.drawPath(
+      Path()..addPolygon([nose, leftEar, rightEar], true),
+      headPaint,
+    );
+    canvas.drawCircle(center, 5, Paint()..color = const Color(0xFF4CAF50));
+    // Ear glow: saturation follows the live meter so "which side is
+    // loud" is readable even with sound off.
+    canvas.drawCircle(
+      leftEar,
+      3.5 + 3 * eL,
+      Paint()
+        ..color = Color.lerp(
+          const Color(0xFF5A6470),
+          const Color(0xFF4FC3F7),
+          eL,
+        )!,
+    );
+    canvas.drawCircle(
+      rightEar,
+      3.5 + 3 * eR,
+      Paint()
+        ..color = Color.lerp(
+          const Color(0xFF5A6470),
+          const Color(0xFFFF8A65),
+          eR,
+        )!,
+    );
+
+    // ── stereo HUD: L/R bars at the canvas edges (they mirror the
+    // headphone channels, not radar north) + ILD readout under the head.
+    if (lvl != null) {
+      _earBar(canvas, Offset(10, center.dy - 24), eL, 'L');
+      _earBar(canvas, Offset(size.width - 16, center.dy - 24), eR, 'R');
+      final ild = lvl.ildDb;
+      if (ild.abs() > 0.5) {
+        final it = _tp(
+          'ILD ${ild > 0 ? '+' : ''}${ild.toStringAsFixed(0)} dB',
+          const TextStyle(
+            fontSize: 10,
+            fontFamily: 'monospace',
+            color: Color(0xFF9AA4B2),
+          ),
+        );
+        it.paint(canvas, center + Offset(-it.width / 2, 28));
+      }
     }
   }
 
+  /// One vertical meter bar: dark well + colored fill from the bottom.
+  static void _earBar(Canvas canvas, Offset topLeft, double v, String tag) {
+    const h = 48.0, w = 6.0;
+    const color = Color(0xFF4FC3F7);
+    final fill = tag == 'L' ? color : const Color(0xFFFF8A65);
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTWH(topLeft.dx, topLeft.dy, w, h),
+        const Radius.circular(3),
+      ),
+      Paint()..color = const Color(0xFF1A2230),
+    );
+    final fh = h * v.clamp(0.0, 1.0);
+    if (fh > 0.5) {
+      canvas.drawRRect(
+        RRect.fromRectAndRadius(
+          Rect.fromLTWH(topLeft.dx, topLeft.dy + h - fh, w, fh),
+          const Radius.circular(3),
+        ),
+        Paint()..color = fill,
+      );
+    }
+    _tp(tag, TextStyle(fontSize: 8, color: fill))
+        .paint(canvas, topLeft + const Offset(0, h + 3));
+  }
+
   @override
-  bool shouldRepaint(_RadarPainter old) => true;
+  bool shouldRepaint(RadarPainter old) => true;
 }

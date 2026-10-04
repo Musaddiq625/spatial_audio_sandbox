@@ -20,4 +20,9 @@ class KeyConstants {
   static const quizLeft = Key('quiz_left');
   static const quizRight = Key('quiz_right');
   static const statusText = Key('status_text');
+  static const labButton = Key('lab_button');
+  static const labSheet = Key('lab_sheet');
+  static const sceneScore = Key('scene_score');
+  static const pipelineStrip = Key('pipeline_strip');
+  static const specJsonButton = Key('spec_json_button');
 }
