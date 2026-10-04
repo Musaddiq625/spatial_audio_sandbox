@@ -47,6 +47,11 @@ void recenter() => RustLib.instance.api.crateApiEngineRecenter();
 void setPredictMs({required double ms}) =>
     RustLib.instance.api.crateApiEngineSetPredictMs(ms: ms);
 
+/// L/R separation exaggeration: 1.0 = natural HRTF, up to 2.0.
+/// Widens the rendered azimuth and deepens the far-ear shadow.
+void setSpatialWidth({required double w}) =>
+    RustLib.instance.api.crateApiEngineSetSpatialWidth(w: w);
+
 /// Restrict head tracking to yaw (heading about gravity): tilts and
 /// in-hand rolls stop swinging the scene's azimuth. Toggleable live.
 void setYawOnly({required bool yawOnly}) =>

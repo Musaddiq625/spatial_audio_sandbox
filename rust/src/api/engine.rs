@@ -215,6 +215,17 @@ pub fn set_predict_ms(ms: f32) {
     }
 }
 
+/// L/R separation exaggeration: 1.0 = natural HRTF, up to 2.0.
+/// Widens the rendered azimuth and deepens the far-ear shadow.
+#[flutter_rust_bridge::frb(sync)]
+pub fn set_spatial_width(w: f32) {
+    if let Ok(mut st) = state().lock() {
+        if let Some(e) = st.engine.as_mut() {
+            e.set_spatial_width(w);
+        }
+    }
+}
+
 /// Restrict head tracking to yaw (heading about gravity): tilts and
 /// in-hand rolls stop swinging the scene's azimuth. Toggleable live.
 #[flutter_rust_bridge::frb(sync)]

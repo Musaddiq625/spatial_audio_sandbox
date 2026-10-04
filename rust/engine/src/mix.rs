@@ -19,6 +19,9 @@ pub enum Cmd {
     Remove { id: u32 },
     SetPos { id: u32, pos: Vec3 },
     SetGain { id: u32, gain: f32 },
+    /// L/R exaggeration: scales the azimuth used for HRIR lookup and
+    /// adds a contralateral-ear level cut. 1.0 = natural.
+    SetWidth { w: f32 },
     Seek { id: u32, pos_s: f32 },
     SetMaster { gain: f32 },
     SetWet { wet: f32 },
@@ -124,6 +127,8 @@ pub struct Mixer {
     verb_r: Fir,
     wet: f32,
     master: f32,
+    /// Lateral exaggeration (>1 widens the stereo image's L/R cue).
+    width: f32,
     pub frames_rendered: u64,
 }
 
@@ -155,6 +160,7 @@ impl Mixer {
                 verb_r,
                 wet: 0.12,
                 master: 0.9,
+                width: 1.3,
                 frames_rendered: 0,
             },
             tx,
@@ -220,6 +226,9 @@ impl Mixer {
                     s.gain_target = gain;
                 }
             }
+            Cmd::SetWidth { w } => {
+                self.width = w.clamp(0.4, 2.0);
+            }
             Cmd::Seek { id, pos_s } => {
                 if let Some(s) = self.sources.iter_mut().find(|s| s.id == id) {
                     s.gen.seek(pos_s, self.sr);
@@ -272,11 +281,16 @@ impl Mixer {
             let dir = head.rotate(s.pos);
             let sph = Spherical::from_vec3(dir);
 
+            // Width: exaggerate the rendered azimuth (super-stereo
+            // trick — a 30 deg source spatializes like ~40 deg at 1.3)
+            // plus an extra contralateral cut below. Soft-clamped so a
+            // lateral source never wraps to the rear.
+            let az_e = (sph.az * self.width).clamp(-2.1, 2.1);
             // Retarget the convolver when the quantized direction moved.
-            let az_q = (sph.az.to_degrees() / 5.0).round() as i32;
+            let az_q = (az_e.to_degrees() / 5.0).round() as i32;
             let el_q = (sph.el.to_degrees() / 15.0).round() as i32;
             if az_q != s.az_q || el_q != s.el_q {
-                let h = self.hrir.hrir(sph.az, sph.el);
+                let h = self.hrir.hrir(az_e, sph.el);
                 // First assignment: no fade — there is no old tail to
                 // preserve, and fading from silence would mis-weight early
                 // vs late taps of the first block.
@@ -314,10 +328,17 @@ impl Mixer {
                 s.gain += (s.gain_target - s.gain) * slew;
                 self.scratch[i] = s.dist_lp.tick(s.gen.tick(self.sr)) * s.gain * dg;
             }
+            // Extra interaural level difference on top of the baked-in
+            // head shadow — this is the cue the ear uses most for L vs
+            // R. Never boosts the far ear (width < 1 still narrows via
+            // the azimuth scale above).
+            let ild_db = ((self.width - 1.0) * 10.0 * sph.az.abs().sin()).max(0.0);
+            let far_cut = 10f32.powf(-ild_db / 20.0);
+            let (gl, gr) = if az_e >= 0.0 { (1.0, far_cut) } else { (far_cut, 1.0) };
             for i in 0..n {
                 let (l, r) = s.conv.tick(self.scratch[i]);
-                out[2 * i] += l;
-                out[2 * i + 1] += r;
+                out[2 * i] += l * gl;
+                out[2 * i + 1] += r * gr;
             }
         }
 
@@ -581,6 +602,37 @@ mod tests {
             ALLOCS.load(Ordering::Relaxed),
             0,
             "process() allocated on the audio path"
+        );
+    }
+
+    /// Width > 1 deepens the L/R level split; width < 1 narrows it.
+    /// This is the cue the ear uses most for left vs right.
+    #[test]
+    fn width_controls_lr_separation() {
+        fn lr_ratio(width: f32) -> f32 {
+            let (mut mix, _slot, mut tx, _trash) = standalone(SAMPLE_RATE);
+            tx.push(Cmd::SetWet { wet: 0.0 }).unwrap();
+            tx.push(Cmd::SetWidth { w: width }).unwrap();
+            tx.push(Cmd::add(
+                1,
+                source::make(SourceKind::Noise),
+                Vec3::new(1.0, 0.5, 0.0), // ~27 deg left
+                1.0,
+                SAMPLE_RATE,
+            ))
+            .unwrap();
+            let mut buf = [0f32; 19200];
+            mix.process(&mut buf);
+            let l: f32 = buf.iter().step_by(2).map(|x| x * x).sum();
+            let r: f32 = buf.iter().skip(1).step_by(2).map(|x| x * x).sum();
+            l / r
+        }
+        let narrow = lr_ratio(0.6);
+        let wide = lr_ratio(2.0);
+        assert!(narrow > 1.0, "left source should favor left ear: {narrow}");
+        assert!(
+            wide > narrow * 1.5,
+            "width 2.0 should deepen separation vs 0.6: {narrow} -> {wide}"
         );
     }
 

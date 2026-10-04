@@ -181,6 +181,7 @@ class _SandboxPageState extends State<SandboxPage> {
   double _virtualYaw = 0; // radians, desktop fallback
   double _yawAtRecenter = 0;
   bool _yawOnly = false; // head tracking mode: false = full 3D
+  double _width = 1.3; // L/R separation exaggeration (matches Rust default)
   int _nextPaletteIdx = 0;
   Timer? _statsTimer;
   final _promptCtl = TextEditingController();
@@ -422,6 +423,9 @@ class _SandboxPageState extends State<SandboxPage> {
     try {
       final info = await engineStart();
       _applyRecenter(); // engine start = "forward is where I face now"
+      // A fresh Mixer forgets tuning — re-send user prefs.
+      setSpatialWidth(w: _width);
+      setYawOnly(yawOnly: _yawOnly);
       // Fresh engine has no sources — re-add local dots and linked beacons.
       for (final s in _sources) {
         if (s.pending) continue; // not due — the ticker realizes it
@@ -1918,6 +1922,36 @@ class _SandboxPageState extends State<SandboxPage> {
           //     ),
           //   ],
           // ),
+          Row(
+            children: [
+              const Text(
+                'width',
+                style: TextStyle(fontSize: 11, color: Color(0xFF9AA4B2)),
+              ),
+              Expanded(
+                child: Slider(
+                  value: _width,
+                  min: 0.5,
+                  max: 2.0,
+                  label: 'L/R ×${_width.toStringAsFixed(1)}',
+                  onChanged: (v) {
+                    setState(() => _width = v);
+                    setSpatialWidth(w: v);
+                  },
+                ),
+              ),
+              SizedBox(
+                width: 56,
+                child: Text(
+                  '×${_width.toStringAsFixed(1)}',
+                  style: const TextStyle(
+                    fontSize: 11,
+                    color: Color(0xFF9AA4B2),
+                  ),
+                ),
+              ),
+            ],
+          ),
           if (!_pose.isLive)
             Row(
               children: [

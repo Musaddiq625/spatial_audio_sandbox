@@ -122,4 +122,10 @@ impl Engine {
     pub fn set_master(&mut self, gain: f32) {
         let _ = self.push(Cmd::SetMaster { gain });
     }
+
+    /// L/R exaggeration: 1.0 natural, up to 2.0. Scales rendered
+    /// azimuth and adds a contralateral-ear cut.
+    pub fn set_spatial_width(&mut self, w: f32) {
+        let _ = self.push(Cmd::SetWidth { w });
+    }
 }
