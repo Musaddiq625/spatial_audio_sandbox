@@ -240,6 +240,7 @@ class _SandboxPageState extends State<SandboxPage> {
     _acoustic.stop();
     _link.dispose();
     _promptCtl.dispose();
+    _radarTick.dispose();
     _director.dispose();
     super.dispose();
   }
@@ -606,6 +607,14 @@ class _SandboxPageState extends State<SandboxPage> {
     final dot = key as SourceDot;
     dot.fileBytes = bytes;
     dot.looping = looping;
+    // Warm the engine's decode cache now — when the cue fires (or the
+    // stand-in upgrade happens below), addFileSource hits the cache and
+    // skips the mp3 decode entirely.
+    unawaited(
+      prepareFileSource(bytes: bytes).catchError(
+        (Object e) => debugPrint('[sfx] ${dot.label}: prepare failed — $e'),
+      ),
+    );
     _syncSeekTicker(); // isFile just flipped — its row should appear
     if (!_engineOn || dot.id == null) {
       // Pending (or engine off): stash the bytes — _ensurePendingAdds
@@ -637,6 +646,10 @@ class _SandboxPageState extends State<SandboxPage> {
   /// their cue and wraps the composition at scene length.
   DateTime? _sceneT0;
   Timer? _seekTicker;
+
+  /// Radar repaint signal — bumped by motion ticks instead of setState
+  /// so position updates repaint the canvas without rebuilding the page.
+  final _radarTick = ValueNotifier<int>(0);
 
   /// Per-source clip status for the "compiling audio" prompt status and
   /// chip spinners — cleared on each scene apply.
@@ -1082,6 +1095,10 @@ class _SandboxPageState extends State<SandboxPage> {
   // keep working after an engine restart re-assigns ids.
   void _directedSetPos(Object key, Offset pos, double z) {
     final dot = key as SourceDot;
+    // Sub-centimeter jitter isn't worth a cross-isolate call or a paint.
+    if ((pos - dot.pos).distance < 0.01 && (z - dot.z).abs() < 0.01) {
+      return;
+    }
     final id = dot.id;
     if (_engineOn && id != null) {
       try {
@@ -1094,7 +1111,10 @@ class _SandboxPageState extends State<SandboxPage> {
     }
     dot.pos = pos;
     dot.z = z;
-    if (mounted) setState(() {});
+    // Repaint only the radar — NOT the whole page. setState here ran
+    // per-source per-motion-tick (~90 rebuilds/s of the full control
+    // panel); a listenable repaint drives just the CustomPaint.
+    _radarTick.value++;
   }
 
   /// A sent prompt + its generated spec — the chip replays it without
@@ -1262,8 +1282,8 @@ class _SandboxPageState extends State<SandboxPage> {
     );
   }
 
-  static String _promptLabel(String p) =>
-      p.length > 30 ? '${p.substring(0, 29)}…' : p;
+  static String _promptLabel(String p) => p;
+      // p.length > 30 ? '${p.substring(0, 29)}…' : p;
 
   // ----- layout -----
 
@@ -1469,14 +1489,17 @@ class _SandboxPageState extends State<SandboxPage> {
           onPanEnd: (_) => _dragTarget = null,
           onLongPressStart: (d) =>
               _onRadarLongPress(d, c.biggest.center(Offset.zero), scale),
-          child: CustomPaint(
-            painter: _RadarPainter(
-              sources: _sources,
-              beacons: _beacons,
-              headYaw: _displayYaw,
-              rangeM: _rangeM,
+          child: RepaintBoundary(
+            child: CustomPaint(
+              painter: _RadarPainter(
+                sources: _sources,
+                beacons: _beacons,
+                headYaw: _displayYaw,
+                rangeM: _rangeM,
+                repaint: _radarTick,
+              ),
+              child: const SizedBox.expand(),
             ),
-            child: const SizedBox.expand(),
           ),
         );
       },
@@ -1940,6 +1963,7 @@ class _RadarPainter extends CustomPainter {
     required this.beacons,
     required this.headYaw,
     required this.rangeM,
+    super.repaint,
   });
   final List<SourceDot> sources;
   final Map<int, _BeaconState> beacons;

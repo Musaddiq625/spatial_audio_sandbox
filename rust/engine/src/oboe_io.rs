@@ -47,7 +47,7 @@ impl AudioOutputCallback for Cb {
 }
 
 pub fn start(pose: Arc<PoseSlot>) -> Result<Engine, String> {
-    let (mixer, cmd_tx): (Mixer, rtrb::Producer<Cmd>) = Mixer::new(SAMPLE_RATE, pose.clone());
+    let (mixer, cmd_tx, trash_rx) = Mixer::new(SAMPLE_RATE, pose.clone());
 
     let mut stream = AudioStreamBuilder::default()
         .set_output()
@@ -81,5 +81,5 @@ pub fn start(pose: Arc<PoseSlot>) -> Result<Engine, String> {
     };
 
     stream.request_start().map_err(|e| format!("oboe start failed: {e:?}"))?;
-    Ok(Engine::assemble(info, cmd_tx, pose, Box::new(Guard { stream })))
+    Ok(Engine::assemble(info, cmd_tx, trash_rx, pose, Box::new(Guard { stream })))
 }

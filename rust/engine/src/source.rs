@@ -251,14 +251,21 @@ impl Source for Rain {
 /// ElevenLabs `loop:true` output); one-shots report `is_finished` and the
 /// mixer drops them on its own.
 pub struct FileSource {
-    buf: Vec<f32>,
+    /// Shared decoded PCM — the clip cache holds another ref, so
+    /// dropping a source on the audio thread never frees megabytes
+    /// mid-callback.
+    buf: std::sync::Arc<Vec<f32>>,
     idx: usize,
     looping: bool,
     done: bool,
 }
 
+/// One-shots decay their last few milliseconds — generated clips end
+/// wherever the model cut them, and a hard stop mid-sample clicks.
+const TAIL_FADE: usize = 128;
+
 impl FileSource {
-    pub fn new(buf: Vec<f32>, looping: bool) -> Self {
+    pub fn new(buf: std::sync::Arc<Vec<f32>>, looping: bool) -> Self {
         let done = buf.is_empty();
         FileSource { buf, idx: 0, looping, done }
     }
@@ -269,13 +276,19 @@ impl Source for FileSource {
         if self.done {
             return 0.0;
         }
-        let x = self.buf[self.idx];
+        let mut x = self.buf[self.idx];
         self.idx += 1;
         if self.idx >= self.buf.len() {
             if self.looping {
                 self.idx = 0;
             } else {
                 self.done = true;
+            }
+        }
+        if !self.looping && self.buf.len() > TAIL_FADE {
+            let rem = self.buf.len() - self.idx;
+            if rem < TAIL_FADE {
+                x *= rem as f32 / TAIL_FADE as f32;
             }
         }
         x
@@ -347,14 +360,14 @@ mod tests {
 
     #[test]
     fn file_source_loops_and_finishes() {
-        let mut one = FileSource::new(vec![0.5; 4], false);
+        let mut one = FileSource::new(std::sync::Arc::new(vec![0.5; 4]), false);
         for _ in 0..4 {
             assert_eq!(one.tick(48_000.0), 0.5);
         }
         assert!(one.is_finished());
         assert_eq!(one.tick(48_000.0), 0.0);
 
-        let mut l = FileSource::new(vec![1.0, -1.0], true);
+        let mut l = FileSource::new(std::sync::Arc::new(vec![1.0, -1.0]), true);
         let got: Vec<f32> = (0..5).map(|_| l.tick(48_000.0)).collect();
         assert_eq!(got, [1.0, -1.0, 1.0, -1.0, 1.0]);
         assert!(!l.is_finished());
@@ -363,7 +376,7 @@ mod tests {
     #[test]
     fn file_source_seeks_and_revives() {
         // 4 samples at a fake 2 Hz rate: seek(s) → idx = s * 2.
-        let mut f = FileSource::new(vec![0.1, 0.2, 0.3, 0.4], false);
+        let mut f = FileSource::new(std::sync::Arc::new(vec![0.1, 0.2, 0.3, 0.4]), false);
         f.seek(1.0, 2.0); // → idx 2
         assert_eq!(f.tick(48_000.0), 0.3);
         assert_eq!(f.tick(48_000.0), 0.4);

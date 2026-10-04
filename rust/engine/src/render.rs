@@ -31,13 +31,14 @@ pub fn render_orbit(
     elev_deg: f32,
     period_s: f32,
 ) -> Result<(), String> {
-    let (mut mix, _slot, mut tx) = standalone(SAMPLE_RATE);
-    tx.push(Cmd::Add {
-        id: 1,
-        gen: source::make(kind),
-        pos: Vec3::new(radius_m, 0.0, 0.0),
-        gain: 1.0,
-    })
+    let (mut mix, _slot, mut tx, _trash) = standalone(SAMPLE_RATE);
+    tx.push(Cmd::add(
+        1,
+        source::make(kind),
+        Vec3::new(radius_m, 0.0, 0.0),
+        1.0,
+        SAMPLE_RATE,
+    ))
     .map_err(|_| "cmd queue full")?;
 
     let total = (seconds * SAMPLE_RATE) as usize;
@@ -68,19 +69,20 @@ pub fn render_static(
     elev_deg: f32,
     dist_m: f32,
 ) -> Result<(), String> {
-    let (mut mix, _slot, mut tx) = standalone(SAMPLE_RATE);
+    let (mut mix, _slot, mut tx, _trash) = standalone(SAMPLE_RATE);
     let az = az_deg.to_radians();
     let el = elev_deg.to_radians();
-    tx.push(Cmd::Add {
-        id: 1,
-        gen: source::make(kind),
-        pos: Vec3::new(
+    tx.push(Cmd::add(
+        1,
+        source::make(kind),
+        Vec3::new(
             dist_m * el.cos() * az.cos(),
             dist_m * el.cos() * az.sin(),
             dist_m * el.sin(),
         ),
-        gain: 1.0,
-    })
+        1.0,
+        SAMPLE_RATE,
+    ))
     .map_err(|_| "cmd queue full")?;
 
     let total = (seconds * SAMPLE_RATE) as usize;

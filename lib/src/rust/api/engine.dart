@@ -6,8 +6,8 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `decode_to_mono`, `normalize_peak`, `resample_linear`, `state`
-// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `State`
+// These functions are ignored because they are not marked as `pub`: `clip_cache`, `clip_key`, `decode_to_mono`, `get_or_decode`, `normalize_peak`, `pose_slot`, `resample_linear`, `state`, `tracker`
+// These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `ClipCache`, `State`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `fmt`, `from`, `from`
 
 /// Start the realtime engine (cpal on desktop, oboe on Android).
@@ -79,9 +79,18 @@ void setSourceGain({required int id, required double gain}) =>
 Future<void> removeSource({required int id}) =>
     RustLib.instance.api.crateApiEngineRemoveSource(id: id);
 
+/// Warm the decode cache for a generated clip so the later
+/// `add_file_source` is a cache hit — call as soon as the clip bytes
+/// land, before the source's cue arrives. Async (worker pool); no-op
+/// while the engine is off.
+Future<void> prepareFileSource({required List<int> bytes}) =>
+    RustLib.instance.api.crateApiEnginePrepareFileSource(bytes: bytes);
+
 /// Play an audio file through the spatial pipeline. `bytes` is any
-/// container symphonia probes (mp3/wav); decoding happens here on the
-/// caller's thread — the audio callback only reads a mono buffer.
+/// container symphonia probes (mp3/wav). Decode/resample runs OUTSIDE
+/// the state lock and is cached — the lock is held only for id
+/// allocation and the command push, so the 60 Hz pose and 30 Hz
+/// position paths never stall behind an mp3 decode.
 Future<FileSourceInfo> addFileSource({
   required List<int> bytes,
   required bool looping,

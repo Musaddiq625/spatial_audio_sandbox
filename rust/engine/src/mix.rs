@@ -11,10 +11,11 @@ use crate::pose::PoseSlot;
 use crate::source::{OnePole, Source, XorShift};
 use std::sync::Arc;
 
-/// Commands into the audio thread. Carrying `Box<dyn Source>` is fine: the
-/// allocation happens on the caller's thread, not the callback's.
+/// Control→audio commands. `Add` carries the fully-built SourceState
+/// — convolver buffers are allocated on the control thread, so the
+/// audio callback only moves a struct into place.
 pub enum Cmd {
-    Add { id: u32, gen: Box<dyn Source>, pos: Vec3, gain: f32 },
+    Add(SourceState),
     Remove { id: u32 },
     SetPos { id: u32, pos: Vec3 },
     SetGain { id: u32, gain: f32 },
@@ -31,7 +32,9 @@ const REF_DIST: f32 = 1.0;
 /// Beyond this distance sources are silent.
 const MAX_DIST: f32 = 60.0;
 
-struct SourceState {
+/// A live source in the mixer. Built on the control thread and moved
+/// through `Cmd::Add` so the audio callback never allocates.
+pub struct SourceState {
     id: u32,
     gen: Box<dyn Source>,
     pos: Vec3,
@@ -39,6 +42,9 @@ struct SourceState {
     /// SetGain target — `gain` slews toward it per-sample (~20 ms ramp)
     /// so fades and mutes don't click.
     gain_target: f32,
+    /// Remove requested — fade out, then move to the trash ring so the
+    /// buffer is dropped on the control thread, not in the callback.
+    removing: bool,
     conv: XFadeConvolver,
     az_q: i32,
     el_q: i32,
@@ -47,19 +53,30 @@ struct SourceState {
 }
 
 impl SourceState {
-    fn new(id: u32, gen: Box<dyn Source>, pos: Vec3, gain: f32, sr: f32) -> Self {
+    /// Construct off the audio thread — allocates convolver state.
+    /// Sources fade in: gain starts at 0 and slews toward `gain`.
+    pub fn new(id: u32, gen: Box<dyn Source>, pos: Vec3, gain: f32, sr: f32) -> Self {
         SourceState {
             id,
             gen,
             pos,
-            gain,
+            gain: 0.0,
             gain_target: gain,
+            removing: false,
             conv: XFadeConvolver::new(),
             az_q: i32::MIN,
             el_q: i32::MIN,
             dist_lp: OnePole::new(20_000.0, sr),
             last_fc: 20_000.0,
         }
+    }
+}
+
+impl Cmd {
+    /// Build an Add command — allocates the source's convolver state on
+    /// the caller's (control) thread so `process` stays alloc-free.
+    pub fn add(id: u32, gen: Box<dyn Source>, pos: Vec3, gain: f32, sr: f32) -> Cmd {
+        Cmd::Add(SourceState::new(id, gen, pos, gain, sr))
     }
 }
 
@@ -95,6 +112,13 @@ pub struct Mixer {
     hrir: SyntheticHrirSet,
     sources: Vec<SourceState>,
     cmd_rx: rtrb::Consumer<Cmd>,
+    /// Audio→control ring: removed/finished sources go here to be
+    /// dropped on the control thread. Never blocks — overflow parks in
+    /// `pending_trash` and retries next block.
+    trash_tx: rtrb::Producer<SourceState>,
+    /// Retired sources waiting for trash ring space. Preallocated so
+    /// pushing is alloc-free on the callback.
+    pending_trash: Vec<SourceState>,
     scratch: Vec<f32>,
     verb_l: Fir,
     verb_r: Fir,
@@ -104,9 +128,14 @@ pub struct Mixer {
 }
 
 impl Mixer {
-    /// Returns the mixer and the command producer the engine handle keeps.
-    pub fn new(sr: f32, pose: Arc<PoseSlot>) -> (Self, rtrb::Producer<Cmd>) {
-        let (tx, rx) = rtrb::RingBuffer::<Cmd>::new(64);
+    /// Returns the mixer, the command producer the engine handle keeps,
+    /// and the trash consumer the engine drains on control calls.
+    pub fn new(
+        sr: f32,
+        pose: Arc<PoseSlot>,
+    ) -> (Self, rtrb::Producer<Cmd>, rtrb::Consumer<SourceState>) {
+        let (tx, rx) = rtrb::RingBuffer::<Cmd>::new(256);
+        let (ttx, trx) = rtrb::RingBuffer::<SourceState>::new(MAX_SOURCES);
         let (il, ir) = build_room_irs(sr);
         let mut verb_l = Fir::new(128);
         verb_l.set_coeffs(&il);
@@ -119,6 +148,8 @@ impl Mixer {
                 hrir: SyntheticHrirSet::new(sr),
                 sources: Vec::with_capacity(MAX_SOURCES),
                 cmd_rx: rx,
+                trash_tx: ttx,
+                pending_trash: Vec::with_capacity(MAX_SOURCES),
                 scratch: vec![0.0; MAX_BLOCK],
                 verb_l,
                 verb_r,
@@ -127,6 +158,7 @@ impl Mixer {
                 frames_rendered: 0,
             },
             tx,
+            trx,
         )
     }
 
@@ -140,15 +172,43 @@ impl Mixer {
         self.apply(c);
     }
 
+    /// Retire a source: push it to the trash ring for the control
+    /// thread to drop. Ring full → park in `pending_trash` (never freed
+    /// on the callback either way).
+    fn retire(&mut self, i: usize) {
+        let ss = self.sources.swap_remove(i);
+        if let Err(rtrb::PushError::Full(back)) = self.trash_tx.push(ss) {
+            self.pending_trash.push(back);
+        }
+    }
+
+    /// Flush parked trash — alloc-free within `pending_trash` capacity.
+    fn drain_trash(&mut self) {
+        while let Some(ss) = self.pending_trash.pop() {
+            match self.trash_tx.push(ss) {
+                Ok(()) => {}
+                Err(rtrb::PushError::Full(back)) => {
+                    self.pending_trash.push(back);
+                    break;
+                }
+            }
+        }
+    }
+
     fn apply(&mut self, c: Cmd) {
         match c {
-            Cmd::Add { id, gen, pos, gain } => {
+            Cmd::Add(ss) => {
                 if self.sources.len() < MAX_SOURCES {
-                    self.sources.push(SourceState::new(id, gen, pos, gain, self.sr));
+                    self.sources.push(ss);
                 }
             }
             Cmd::Remove { id } => {
-                self.sources.retain(|s| s.id != id);
+                // Fade out first — an instant removal clicks and frees
+                // the buffer on the audio thread.
+                if let Some(s) = self.sources.iter_mut().find(|s| s.id == id) {
+                    s.removing = true;
+                    s.gain_target = 0.0;
+                }
             }
             Cmd::SetPos { id, pos } => {
                 if let Some(s) = self.sources.iter_mut().find(|s| s.id == id) {
@@ -191,6 +251,7 @@ impl Mixer {
         while let Ok(c) = self.cmd_rx.pop() {
             self.apply(c);
         }
+        self.drain_trash();
         for chunk in out.chunks_mut(self.scratch.len() * 2) {
             self.process_chunk(chunk);
         }
@@ -201,13 +262,12 @@ impl Mixer {
         out.fill(0.0);
         let head = self.pose.read().head;
 
-        // Snapshot so we can retain() finished sources after the loop.
-        let mut finished = false;
-
         for s in self.sources.iter_mut() {
-            if s.gen.is_finished() {
-                finished = true;
-                continue;
+            // Finished one-shots and Remove'd sources fade through the
+            // convolver tail instead of hard-cutting — then retire.
+            if s.gen.is_finished() || s.removing {
+                s.removing = true;
+                s.gain_target = 0.0;
             }
             let dir = head.rotate(s.pos);
             let sph = Spherical::from_vec3(dir);
@@ -261,8 +321,16 @@ impl Mixer {
             }
         }
 
-        if finished {
-            self.sources.retain(|s| !s.gen.is_finished());
+        // Retire sources whose fade-out converged — off the RT thread
+        // via the trash ring, so no big frees in the callback.
+        let mut i = 0;
+        while i < self.sources.len() {
+            let s = &self.sources[i];
+            if s.removing && s.gain <= 1e-4 {
+                self.retire(i);
+            } else {
+                i += 1;
+            }
         }
 
         // Room tail on the mid signal.
@@ -284,11 +352,15 @@ impl Mixer {
     }
 }
 
-/// Convenience: a mixer + pose slot + producer for tests and offline renders.
-pub fn standalone(sr: f32) -> (Mixer, Arc<PoseSlot>, rtrb::Producer<Cmd>) {
+/// Convenience: a mixer + pose slot + producers for tests and offline
+/// renders. The trash consumer is returned too — drain it to inspect
+/// retired sources.
+pub fn standalone(
+    sr: f32,
+) -> (Mixer, Arc<PoseSlot>, rtrb::Producer<Cmd>, rtrb::Consumer<SourceState>) {
     let slot = Arc::new(PoseSlot::new());
-    let (mix, tx) = Mixer::new(sr, slot.clone());
-    (mix, slot, tx)
+    let (mix, tx, trash) = Mixer::new(sr, slot.clone());
+    (mix, slot, tx, trash)
 }
 
 #[cfg(test)]
@@ -301,16 +373,17 @@ mod tests {
     /// Click at hard left must reach the left ear before the right ear.
     #[test]
     fn click_left_shows_itd_and_ild() {
-        let (mut mix, _slot, mut tx) = standalone(SAMPLE_RATE);
+        let (mut mix, _slot, mut tx, _trash) = standalone(SAMPLE_RATE);
         // Measure the direct path only — the decorrelated room tail would
         // swamp a single click's ILD.
         tx.push(Cmd::SetWet { wet: 0.0 }).unwrap();
-        tx.push(Cmd::Add {
-            id: 1,
-            gen: source::make(SourceKind::Click),
-            pos: Vec3::new(0.0, 1.0, 0.0), // hard left
-            gain: 1.0,
-        })
+        tx.push(Cmd::add(
+            1,
+            source::make(SourceKind::Click),
+            Vec3::new(0.0, 1.0, 0.0), // hard left
+            1.0,
+            SAMPLE_RATE,
+        ))
         .unwrap();
         let mut buf = [0f32; 256];
         mix.process(&mut buf);
@@ -325,13 +398,14 @@ mod tests {
     fn head_turn_moves_image() {
         use crate::pose::Pose;
         use std::f32::consts::FRAC_PI_2;
-        let (mut mix, slot, mut tx) = standalone(SAMPLE_RATE);
-        tx.push(Cmd::Add {
-            id: 1,
-            gen: source::make(SourceKind::Click),
-            pos: Vec3::new(1.0, 0.0, 0.0), // scene front
-            gain: 1.0,
-        })
+        let (mut mix, slot, mut tx, _trash) = standalone(SAMPLE_RATE);
+        tx.push(Cmd::add(
+            1,
+            source::make(SourceKind::Click),
+            Vec3::new(1.0, 0.0, 0.0), // scene front
+            1.0,
+            SAMPLE_RATE,
+        ))
         .unwrap();
         // Head turned 90 deg right => front source sits at hard left in
         // head coords => left ear fires first.
@@ -349,13 +423,18 @@ mod tests {
     /// mute would click otherwise.
     #[test]
     fn gain_ramps_toward_target() {
-        let (mut mix, _slot, _tx) = standalone(SAMPLE_RATE);
-        mix.push_cmd(Cmd::Add {
-            id: 1,
-            gen: source::make(SourceKind::Tone),
-            pos: Vec3::new(1.0, 0.0, 0.0),
-            gain: 1.0,
-        });
+        let (mut mix, _slot, _tx, _trash) = standalone(SAMPLE_RATE);
+        mix.push_cmd(Cmd::add(
+            1,
+            source::make(SourceKind::Tone),
+            Vec3::new(1.0, 0.0, 0.0),
+            1.0,
+            SAMPLE_RATE,
+        ));
+        // Adds fade in from 0 — render ~200 ms so the fade-in converges
+        // before measuring the SetGain slew.
+        let mut buf = [0f32; 19200];
+        mix.process(&mut buf);
         mix.push_cmd(Cmd::SetGain { id: 1, gain: 0.5 });
         let mut buf = [0f32; 480]; // 240 frames ≈ 5 ms — still mid-ramp
         mix.process(&mut buf);
@@ -367,6 +446,141 @@ mod tests {
             (mix.sources[0].gain - 0.5).abs() < 0.01,
             "gain should reach target: {}",
             mix.sources[0].gain
+        );
+    }
+
+    /// Newly added sources fade in from silence — a hard gain jump on
+    /// add clicks at the convolution edge.
+    #[test]
+    fn add_fades_in() {
+        let (mut mix, _slot, _tx, _trash) = standalone(SAMPLE_RATE);
+        mix.push_cmd(Cmd::add(
+            1,
+            source::make(SourceKind::Tone),
+            Vec3::new(1.0, 0.0, 0.0),
+            1.0,
+            SAMPLE_RATE,
+        ));
+        let mut buf = [0f32; 256];
+        mix.process(&mut buf);
+        assert!(
+            mix.sources[0].gain > 0.0 && mix.sources[0].gain < 0.9,
+            "gain should still be ramping up: {}",
+            mix.sources[0].gain
+        );
+    }
+
+    /// Remove fades out, then retires the source to the trash ring —
+    /// the buffer is dropped by the consumer (control thread), never
+    /// freed inside process().
+    #[test]
+    fn remove_fades_then_retires() {
+        let (mut mix, _slot, _tx, mut trash) = standalone(SAMPLE_RATE);
+        mix.push_cmd(Cmd::add(
+            1,
+            source::make(SourceKind::Tone),
+            Vec3::new(1.0, 0.0, 0.0),
+            1.0,
+            SAMPLE_RATE,
+        ));
+        let mut buf = [0f32; 19200]; // ~200 ms — fade-in converges
+        mix.process(&mut buf);
+        mix.push_cmd(Cmd::Remove { id: 1 });
+        let mut buf = [0f32; 128]; // one small block — still fading
+        mix.process(&mut buf);
+        assert_eq!(mix.sources.len(), 1, "fading source still in the mix");
+        assert!(mix.sources[0].removing);
+        let mut buf = [0f32; 19200]; // ~200 ms — fade-out converges
+        mix.process(&mut buf);
+        assert_eq!(mix.sources.len(), 0, "retired out of the source list");
+        assert!(trash.pop().is_ok(), "retired source lands on trash ring");
+    }
+
+    /// A finished one-shot is retired the same way — no abrupt free or
+    /// silent source leaking forever.
+    #[test]
+    fn finished_source_retires() {
+        let (mut mix, _slot, _tx, mut trash) = standalone(SAMPLE_RATE);
+        mix.push_cmd(Cmd::add(
+            1,
+            Box::new(crate::source::FileSource::new(
+                std::sync::Arc::new(vec![0.1f32; 32]),
+                false,
+            )),
+            Vec3::new(1.0, 0.0, 0.0),
+            1.0,
+            SAMPLE_RATE,
+        ));
+        let mut buf = [0f32; 38400]; // ~400 ms — plays out + fades + retires
+        mix.process(&mut buf);
+        assert_eq!(mix.sources.len(), 0);
+        assert!(trash.pop().is_ok());
+    }
+
+    // ── RT-safety guard ─────────────────────────────────────────────
+    // Counting allocator: only active while ENABLED — proves process()
+    // performs no heap allocation with a burst of add/remove commands.
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Thread-local gate — cargo runs tests in parallel, so a plain
+    /// atomic would count sibling tests' allocations too.
+    thread_local! {
+        static ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+
+    struct Counting;
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+            if ENABLED.with(|e| e.get()) {
+                ALLOCS.fetch_add(1, Ordering::Relaxed);
+            }
+            System.alloc(l)
+        }
+        unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+            System.dealloc(p, l)
+        }
+    }
+
+    #[global_allocator]
+    static A: Counting = Counting;
+
+    /// Fill the mixer with a burst of adds/removes, then run process()
+    /// under the counting allocator — zero allocations allowed.
+    #[test]
+    fn process_is_alloc_free() {
+        let (mut mix, _slot, mut tx, _trash) = standalone(SAMPLE_RATE);
+        // Park a full trash ring + pending queue so retirement paths run.
+        for i in 0..MAX_SOURCES as u32 {
+            tx.push(Cmd::add(
+                i,
+                Box::new(crate::source::FileSource::new(
+                    std::sync::Arc::new(vec![0.1f32; 32]),
+                    false,
+                )),
+                Vec3::new(1.0, 0.0, 0.0),
+                1.0,
+                SAMPLE_RATE,
+            ))
+            .unwrap();
+            tx.push(Cmd::Remove { id: i }).unwrap();
+            tx.push(Cmd::SetPos { id: i, pos: Vec3::new(0.0, 1.0, 0.0) })
+                .unwrap();
+        }
+        // Warm up outside the counted region — HRIR lookup etc.
+        let mut buf = [0f32; 256];
+        mix.process(&mut buf);
+
+        ALLOCS.store(0, Ordering::Relaxed);
+        ENABLED.with(|e| e.set(true));
+        let mut buf = [0f32; 512];
+        mix.process(&mut buf);
+        ENABLED.with(|e| e.set(false));
+        assert_eq!(
+            ALLOCS.load(Ordering::Relaxed),
+            0,
+            "process() allocated on the audio path"
         );
     }
 

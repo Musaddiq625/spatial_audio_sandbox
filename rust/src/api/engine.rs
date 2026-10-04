@@ -66,21 +66,95 @@ impl From<SourceKindWire> for SourceKind {
 
 struct State {
     engine: Option<Engine>,
-    tracker: PoseTracker,
     next_id: u32,
 }
 
 static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 
+/// The pose path gets its own locks: `set_head_pose` fires ~60 Hz from
+/// the sensor bridge and must never queue behind an engine op or a
+/// clip decode on the state mutex.
+static POSE_SLOT: OnceLock<Arc<PoseSlot>> = OnceLock::new();
+static TRACKER: OnceLock<Mutex<PoseTracker>> = OnceLock::new();
+
+fn pose_slot() -> Arc<PoseSlot> {
+    POSE_SLOT.get_or_init(|| Arc::new(PoseSlot::new())).clone()
+}
+
+fn tracker() -> &'static Mutex<PoseTracker> {
+    TRACKER.get_or_init(|| Mutex::new(PoseTracker::new(pose_slot())))
+}
+
 fn state() -> &'static Mutex<State> {
-    STATE.get_or_init(|| {
-        let slot = Arc::new(PoseSlot::new());
-        Mutex::new(State {
-            engine: None,
-            tracker: PoseTracker::new(slot),
-            next_id: 1,
+    STATE.get_or_init(|| Mutex::new(State { engine: None, next_id: 1 }))
+}
+
+// ── Clip cache ─────────────────────────────────────────────────────
+// Decoded mono PCM at the engine sample rate, keyed by content hash.
+// FileSource holds an Arc into this, so scrub-back, scene wraps, and
+// engine restarts re-add clips without re-decoding — and a source drop
+// never frees megabytes on the audio thread.
+
+struct ClipCache {
+    map: std::collections::HashMap<u64, std::sync::Arc<Vec<f32>>>,
+    order: std::collections::VecDeque<u64>,
+    bytes: usize,
+}
+
+static CLIP_CACHE: OnceLock<Mutex<ClipCache>> = OnceLock::new();
+const CLIP_CACHE_MAX: usize = 64 << 20; // 64 MB of decoded PCM
+
+fn clip_cache() -> &'static Mutex<ClipCache> {
+    CLIP_CACHE.get_or_init(|| {
+        Mutex::new(ClipCache {
+            map: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            bytes: 0,
         })
     })
+}
+
+fn clip_key(bytes: &[u8], sr: f32) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    sr.to_bits().hash(&mut h);
+    h.finish()
+}
+
+/// Decode-or-fetch. The decode runs unlocked — only the map touch and
+/// the insert take the cache mutex, for microseconds.
+fn get_or_decode(bytes: &[u8], sr: f32) -> Result<std::sync::Arc<Vec<f32>>> {
+    let key = clip_key(bytes, sr);
+    {
+        let c = clip_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = c.map.get(&key) {
+            return Ok(hit.clone());
+        }
+    }
+    let t0 = std::time::Instant::now();
+    let pcm = std::sync::Arc::new(decode_to_mono(bytes, sr)?);
+    eprintln!(
+        "[engine] decoded {}B -> {} samples in {:.1}ms",
+        bytes.len(),
+        pcm.len(),
+        t0.elapsed().as_secs_f64() * 1000.0
+    );
+    let mut c = clip_cache().lock().unwrap_or_else(|e| e.into_inner());
+    c.bytes += pcm.len() * 4;
+    c.order.push_back(key);
+    c.map.insert(key, pcm.clone());
+    while c.bytes > CLIP_CACHE_MAX {
+        match c.order.pop_front() {
+            Some(k) => {
+                if let Some(old) = c.map.remove(&k) {
+                    c.bytes -= old.len() * 4;
+                }
+            }
+            None => break,
+        }
+    }
+    Ok(pcm)
 }
 
 /// Start the realtime engine (cpal on desktop, oboe on Android).
@@ -91,7 +165,7 @@ pub fn engine_start() -> Result<EngineInfoWire> {
         let info: EngineInfoWire = st.engine.as_ref().unwrap().info.clone().into();
         return Ok(info);
     }
-    let engine = Engine::start(st.tracker.slot()).map_err(|e| anyhow!(e))?;
+    let engine = Engine::start(pose_slot()).map_err(|e| anyhow!(e))?;
     let info = engine.info.clone().into();
     st.engine = Some(engine);
     Ok(info)
@@ -119,25 +193,25 @@ pub fn engine_info() -> Option<EngineInfoWire> {
 /// Called at ~60 Hz from the sensor stream — keep it cheap and sync.
 #[flutter_rust_bridge::frb(sync)]
 pub fn set_head_pose(w: f32, x: f32, y: f32, z: f32, gx: f32, gy: f32, gz: f32) {
-    if let Ok(mut st) = state().lock() {
-        st.tracker.update(w, x, y, z, gx, gy, gz);
+    if let Ok(mut t) = tracker().lock() {
+        t.update(w, x, y, z, gx, gy, gz);
     }
 }
 
 /// Latch the current orientation as "forward".
 #[flutter_rust_bridge::frb(sync)]
 pub fn recenter() {
-    if let Ok(mut st) = state().lock() {
-        st.tracker.recenter();
+    if let Ok(mut t) = tracker().lock() {
+        t.recenter();
     }
 }
 
 /// Prediction horizon in milliseconds (e.g. measured BT output latency).
 #[flutter_rust_bridge::frb(sync)]
 pub fn set_predict_ms(ms: f32) {
-    if let Ok(mut st) = state().lock() {
-        st.tracker.predict_secs = ms / 1000.0;
-        st.tracker.refresh();
+    if let Ok(mut t) = tracker().lock() {
+        t.predict_secs = ms / 1000.0;
+        t.refresh();
     }
 }
 
@@ -186,9 +260,26 @@ pub struct FileSourceInfo {
     pub duration_s: f32,
 }
 
+/// Warm the decode cache for a generated clip so the later
+/// `add_file_source` is a cache hit — call as soon as the clip bytes
+/// land, before the source's cue arrives. Async (worker pool); no-op
+/// while the engine is off.
+pub fn prepare_file_source(bytes: Vec<u8>) -> Result<()> {
+    let sr = {
+        let st = state().lock().map_err(|_| anyhow!("state poisoned"))?;
+        st.engine.as_ref().map(|e| e.info.sample_rate as f32)
+    };
+    if let Some(sr) = sr {
+        get_or_decode(&bytes, sr)?;
+    }
+    Ok(())
+}
+
 /// Play an audio file through the spatial pipeline. `bytes` is any
-/// container symphonia probes (mp3/wav); decoding happens here on the
-/// caller's thread — the audio callback only reads a mono buffer.
+/// container symphonia probes (mp3/wav). Decode/resample runs OUTSIDE
+/// the state lock and is cached — the lock is held only for id
+/// allocation and the command push, so the 60 Hz pose and 30 Hz
+/// position paths never stall behind an mp3 decode.
 pub fn add_file_source(
     bytes: Vec<u8>,
     looping: bool,
@@ -197,20 +288,24 @@ pub fn add_file_source(
     z: f32,
     gain: f32,
 ) -> Result<FileSourceInfo> {
-    let mut st = state().lock().map_err(|_| anyhow!("state poisoned"))?;
-    let sr = st
-        .engine
-        .as_ref()
-        .ok_or_else(|| anyhow!("engine not running"))?
-        .info
-        .sample_rate as f32;
-    let id = st.next_id;
-    st.next_id += 1;
-    let pcm = decode_to_mono(&bytes, sr)?;
+    let (sr, id) = {
+        let mut st = state().lock().map_err(|_| anyhow!("state poisoned"))?;
+        let sr = st
+            .engine
+            .as_ref()
+            .ok_or_else(|| anyhow!("engine not running"))?
+            .info
+            .sample_rate as f32;
+        let id = st.next_id;
+        st.next_id += 1;
+        (sr, id)
+    };
+    let pcm = get_or_decode(&bytes, sr)?;
     let duration_s = pcm.len() as f32 / sr;
+    let mut st = state().lock().map_err(|_| anyhow!("state poisoned"))?;
     st.engine
         .as_mut()
-        .unwrap()
+        .ok_or_else(|| anyhow!("engine not running"))?
         .add_custom(
             Box::new(FileSource::new(pcm, looping)),
             Vec3::new(x, y, z),
