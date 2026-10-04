@@ -259,28 +259,42 @@ class SceneDirector {
     return null;
   }
 
-  /// When the prompt sequences events but the model left every delay_s
-  /// at 0 (a common 1B miss), infer cues deterministically: explicit
-  /// "after N" numbers map onto later sources in spec order, remaining
-  /// sources stagger by 2s. The model's own delay_s always wins — this
-  /// only fires when all of them are 0.
+  /// Delay-trust guard + deterministic timing fallback:
+  /// 1. No timing words in the prompt → force every delay_s to 0 — the
+  ///    schema requires the field so the model must emit *something*,
+  ///    and it may copy few-shot values onto untimed prompts. An
+  ///    untimed prompt means an untimed scene.
+  /// 2. Timing words + any model delay > 0 → trust the model.
+  /// 3. Timing words + all delays 0 (a common 1B miss) → infer:
+  ///    explicit "after N" numbers map onto later sources in spec
+  ///    order (or the single source itself), remaining sources
+  ///    stagger by 2s.
   static void inferTiming(SceneSpec spec, String prompt) {
-    if (spec.sources.length < 2) return;
-    if (spec.sources.any((s) => s.delayS > 0)) return;
-    if (!RegExp(r'\b(after|then|later|suddenly|eventually)\b',
+    final hasCue =
+        RegExp(r'\b(after|then|later|suddenly|eventually)\b',
             caseSensitive: false)
-        .hasMatch(prompt)) {
+        .hasMatch(prompt);
+    if (!hasCue) {
+      for (final s in spec.sources) {
+        s.delayS = 0;
+      }
       return;
     }
+    if (spec.sources.any((s) => s.delayS > 0)) return;
     final cues = RegExp(r'after\s*(\d+(?:\.\d+)?)', caseSensitive: false)
         .allMatches(prompt)
         .map((m) => double.parse(m.group(1)!))
         .toList();
-    for (var i = 1; i < spec.sources.length; i++) {
-      final s = spec.sources[i];
-      s.delayS = i <= cues.length
-          ? cues[i - 1]
-          : (cues.isEmpty ? i * 2.0 : cues.last + 2 * (i - cues.length));
+    // Single-source spec: the cue applies to it directly. Multi-source:
+    // index 0 is the ambience bed and stays at 0.
+    final start = spec.sources.length < 2 ? 0 : 1;
+    for (var i = start; i < spec.sources.length; i++) {
+      final j = i - start;
+      spec.sources[i].delayS = j < cues.length
+          ? cues[j]
+          : (cues.isEmpty
+              ? (j + 1) * 2.0
+              : cues.last + 2 * (j - cues.length + 1));
     }
     debugPrint('[director] inferred timing from prompt: '
         '${spec.sources.map((s) => '${s.name}=${s.delayS}s').join(', ')}');

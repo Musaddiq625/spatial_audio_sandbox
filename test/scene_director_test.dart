@@ -205,4 +205,20 @@ void main() {
     SceneDirector.inferTiming(authored, 'rain, then after 2 seconds wind');
     expect(authored.sources[1].delayS, 7); // model's delay_s wins
   });
+
+  test('inferTiming zeroes model delays on untimed prompts', () {
+    // The model may copy few-shot delay values onto prompts that never
+    // asked for timing — with no timing words, delay_s can't be trusted.
+    final s = SceneDirector.parseSpec('{"sources":['
+        '{"kind":"rain"},{"kind":"noise","delay_s":2},'
+        '{"kind":"noise","delay_s":4}]}');
+    SceneDirector.inferTiming(s, 'rain, wind, and a plane overhead');
+    expect(s.sources.every((x) => x.delayS == 0), isTrue);
+  });
+
+  test('inferTiming applies "after N" to a single-source spec', () {
+    final s = SceneDirector.parseSpec('{"sources":[{"kind":"noise"}]}');
+    SceneDirector.inferTiming(s, 'after 3 seconds a dragon roars');
+    expect(s.sources.single.delayS, 3);
+  });
 }

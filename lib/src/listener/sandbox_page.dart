@@ -168,7 +168,7 @@ class _SandboxPageState extends State<SandboxPage> {
   String _localIp = '?';
   EngineInfoWire? _info;
   bool _engineOn = false;
-  double _predictMs = 0;
+  // double _predictMs = 0;
   double _virtualYaw = 0; // radians, desktop fallback
   double _yawAtRecenter = 0;
   int _nextPaletteIdx = 0;
@@ -380,6 +380,8 @@ class _SandboxPageState extends State<SandboxPage> {
 
   Future<void> _stopEngine() async {
     _director.setMotionPaused(true); // freeze directed dots on the radar
+    _scrubbing = false; // drop any in-flight scrub commit
+    _scrubT = null;
     await engineStop();
     // The engine dropped every source — ids are now stale.
     for (final b in _beacons.values) {
@@ -634,6 +636,8 @@ class _SandboxPageState extends State<SandboxPage> {
   void _onSceneStart(DateTime t0) {
     _sceneT0 = t0;
     _clipStatus.clear();
+    _scrubbing = false; // a stale drag must not commit onto the new scene
+    _scrubT = null;
   }
 
   void _syncSeekTicker() {
@@ -641,7 +645,9 @@ class _SandboxPageState extends State<SandboxPage> {
         _engineOn && _sources.any((s) => s.isFile || s.needsSource);
     if (active) {
       _seekTicker ??= Timer.periodic(const Duration(milliseconds: 250), (_) {
-        if (!mounted) return;
+        // No mid-drag work: wraps and pending adds would fight the
+        // preview and flood the 64-slot command queue.
+        if (!mounted || _scrubbing) return;
         final len = _sceneLen;
         if (len > 0 && _sceneT >= len) {
           _sceneSeek(_sceneT % len); // scene wraps — composition repeats
@@ -699,7 +705,49 @@ class _SandboxPageState extends State<SandboxPage> {
     debugPrint('[scene] ${dot.label}: live at ${local.toStringAsFixed(1)}s');
   }
 
-  /// Master-bar scrub: re-anchor the scene clock, motion anchors, and
+  /// Two-phase scene scrub: while dragging it's a muted visual preview
+  /// (no engine writes — a per-pixel burst of seeks would silently
+  /// overflow the 64-slot command queue, which is why scrubbing used to
+  /// only reposition the first sources). On release, one atomic commit.
+  bool _scrubbing = false;
+  double? _scrubT;
+
+  void _scrubStart() {
+    _scrubbing = true;
+    _director.setMotionPaused(true); // freeze radar/motion while held
+    // Mute every live source — the "pause" while previewing. Per-source
+    // SetGain silently no-ops on stale ids, so this is safe wholesale.
+    for (final dot in _sources) {
+      final id = dot.id;
+      if (id != null) setSourceGain(id: id, gain: 0);
+    }
+  }
+
+  void _scrubMove(double v) {
+    _scrubT = v;
+    // Preview anchor only — chips/time text track the finger. Zero
+    // engine calls here; the commit happens on release.
+    _sceneT0 = DateTime.now()
+        .subtract(Duration(milliseconds: (v * 1000).round()));
+    setState(() {});
+  }
+
+  void _scrubEnd(double v) {
+    if (!_scrubbing) return; // scene changed mid-drag — drop the commit
+    _scrubbing = false;
+    _scrubT = null;
+    _sceneSeek(v); // the one atomic burst: seeks, removes, pending adds
+    if (_engineOn) {
+      _director.setMotionPaused(false);
+      for (final dot in _sources) {
+        final id = dot.id;
+        if (id != null) setSourceGain(id: id, gain: dot.gain);
+      }
+    }
+    setState(() {});
+  }
+
+  /// Master-bar commit: re-anchor the scene clock, motion anchors, and
   /// every authored dot's engine source to the new scene time.
   void _sceneSeek(double t) {
     if (_sceneT0 == null) return;
@@ -717,14 +765,19 @@ class _SandboxPageState extends State<SandboxPage> {
         // Before its cue — go silent: drop the engine source, the dot
         // becomes pending and re-realizes on a forward scrub/tick.
         if (dot.id != null) {
-          try {
-            removeSource(id: dot.id!);
-          } catch (_) {}
+          final id = dot.id!;
           dot.id = null;
+          if (_engineOn) {
+            unawaited(removeSource(id: id).catchError(
+              (e) => debugPrint(
+                '[scene] ${dot.label}: remove failed — $e',
+              ),
+            ));
+          }
         }
         continue;
       }
-      if (dot.isFile && dot.id != null && !dot.finished) {
+      if (_engineOn && dot.isFile && dot.id != null && !dot.finished) {
         final dur = dot.fileDurS ?? 0;
         if (dur > 0) {
           final pos = dot.looping ? local % dur : local.clamp(0.0, dur);
@@ -749,6 +802,13 @@ class _SandboxPageState extends State<SandboxPage> {
   }
 
   void _seekTo(SourceDot d, double pos) {
+    if (d.finished) {
+      // Engine already dropped the one-shot — route through the revive
+      // path (re-add + seek) instead of seeking a dead id.
+      d.id = null;
+      unawaited(_realizeAt(d, pos));
+      return;
+    }
     if (_engineOn && d.id != null) seekSource(id: d.id!, posS: pos);
     // Re-anchor the local estimate to the new playhead.
     d.fileT0 = DateTime.now().subtract(
@@ -763,7 +823,8 @@ class _SandboxPageState extends State<SandboxPage> {
   /// exactly as authored.
   Widget _sceneRow() {
     final len = _sceneLen;
-    final t = len > 0 ? _sceneT % len : 0.0;
+    final t = _scrubT ?? (len > 0 ? _sceneT % len : 0.0);
+    final live = _engineOn && len > 0;
     return Padding(
       padding: const EdgeInsets.only(top: 6),
       child: Row(
@@ -791,7 +852,9 @@ class _SandboxPageState extends State<SandboxPage> {
                 child: Slider(
                   value: t.clamp(0.0, len > 0 ? len : 1),
                   max: len > 0 ? len : 1,
-                  onChanged: _engineOn && len > 0 ? _sceneSeek : null,
+                  onChangeStart: live ? (_) => _scrubStart() : null,
+                  onChanged: live ? _scrubMove : null,
+                  onChangeEnd: live ? _scrubEnd : null,
                 ),
               ),
             ),
@@ -978,11 +1041,11 @@ class _SandboxPageState extends State<SandboxPage> {
     await _director.apply(spec);
   }
 
-  Future<void> _demoScene() async {
-    await _addSource(SourceKindWire.bee);
-    await _addSource(SourceKindWire.rain);
-    await _addSource(SourceKindWire.pad);
-  }
+  // Future<void> _demoScene() async {
+  //   await _addSource(SourceKindWire.bee);
+  //   await _addSource(SourceKindWire.rain);
+  //   await _addSource(SourceKindWire.pad);
+  // }
 
   void _clearAll() {
     for (final s in _sources) {
@@ -992,6 +1055,8 @@ class _SandboxPageState extends State<SandboxPage> {
     _sources.clear();
     _director.reset();
     _sceneT0 = null;
+    _scrubbing = false;
+    _scrubT = null;
     _syncSeekTicker();
     setState(() {});
   }
@@ -1003,11 +1068,11 @@ class _SandboxPageState extends State<SandboxPage> {
     _syncSeekTicker();
   }
 
-  void _recenter() {
-    recenter();
-    _yawAtRecenter = _displayYawRaw();
-    _virtualYaw = 0;
-  }
+  // void _recenter() {
+  //   recenter();
+  //   _yawAtRecenter = _displayYawRaw();
+  //   _virtualYaw = 0;
+  // }
 
   double _displayYawRaw() {
     final q = _pose.lastQuat.value;
@@ -1178,57 +1243,57 @@ class _SandboxPageState extends State<SandboxPage> {
     ),
   );
 
-  Widget _infoBar() {
-    final i = _info;
-    final sensor = _pose.isLive
-        ? 'sensor: live'
-        : 'sensor: none (virtual head)';
-    final linked = _beacons.isEmpty
-        ? (_announced.isEmpty ? 'no beacons' : 'beacon seen')
-        : 'beacons: ${_beacons.length}';
-    final net = switch (_net.current.state) {
-      NetState.offline => 'offline',
-      NetState.hotspotHost => 'hotspot',
-      NetState.wifi =>
-        (_peerApHost || _beacons.values.any((b) => b.apHost))
-            ? 'hotspot'
-            : 'wifi',
-    };
-    final rx = 'rx ${_link.rxCount}';
-    const base = TextStyle(
-      fontSize: 11,
-      fontFamily: 'monospace',
-      color: Color(0xFF9AA4B2),
-    );
-    final pre = i == null
-        ? 'engine off — $sensor — $linked — '
-        : '${i.backend}/${i.api}  ${i.sampleRate}Hz ${i.channels}ch  '
-              'burst ${i.framesPerBurst}  buf ${i.bufferSizeFrames}/${i.bufferCapacityFrames}  '
-              '${i.performanceMode}/${i.sharingMode}  '
-              'latency ${i.latencyMs == null ? "n/a" : "${i.latencyMs!.toStringAsFixed(1)}ms"} — $sensor — $linked — ';
-    return Container(
-      width: double.infinity,
-      color: const Color(0xFF12161F),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-      child: Text.rich(
-        TextSpan(
-          style: base,
-          children: [
-            TextSpan(text: pre),
-            TextSpan(
-              text: net,
-              style: TextStyle(
-                color: _net.current.state == NetState.offline
-                    ? const Color(0xFFE57373)
-                    : const Color(0xFF9AA4B2),
-              ),
-            ),
-            TextSpan(text: ' — $rx — ip $_localIp'),
-          ],
-        ),
-      ),
-    );
-  }
+  // Widget _infoBar() {
+  //   final i = _info;
+  //   final sensor = _pose.isLive
+  //       ? 'sensor: live'
+  //       : 'sensor: none (virtual head)';
+  //   final linked = _beacons.isEmpty
+  //       ? (_announced.isEmpty ? 'no beacons' : 'beacon seen')
+  //       : 'beacons: ${_beacons.length}';
+  //   final net = switch (_net.current.state) {
+  //     NetState.offline => 'offline',
+  //     NetState.hotspotHost => 'hotspot',
+  //     NetState.wifi =>
+  //       (_peerApHost || _beacons.values.any((b) => b.apHost))
+  //           ? 'hotspot'
+  //           : 'wifi',
+  //   };
+  //   final rx = 'rx ${_link.rxCount}';
+  //   const base = TextStyle(
+  //     fontSize: 11,
+  //     fontFamily: 'monospace',
+  //     color: Color(0xFF9AA4B2),
+  //   );
+  //   final pre = i == null
+  //       ? 'engine off — $sensor — $linked — '
+  //       : '${i.backend}/${i.api}  ${i.sampleRate}Hz ${i.channels}ch  '
+  //             'burst ${i.framesPerBurst}  buf ${i.bufferSizeFrames}/${i.bufferCapacityFrames}  '
+  //             '${i.performanceMode}/${i.sharingMode}  '
+  //             'latency ${i.latencyMs == null ? "n/a" : "${i.latencyMs!.toStringAsFixed(1)}ms"} — $sensor — $linked — ';
+  //   return Container(
+  //     width: double.infinity,
+  //     color: const Color(0xFF12161F),
+  //     padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+  //     child: Text.rich(
+  //       TextSpan(
+  //         style: base,
+  //         children: [
+  //           TextSpan(text: pre),
+  //           TextSpan(
+  //             text: net,
+  //             style: TextStyle(
+  //               color: _net.current.state == NetState.offline
+  //                   ? const Color(0xFFE57373)
+  //                   : const Color(0xFF9AA4B2),
+  //             ),
+  //           ),
+  //           TextSpan(text: ' — $rx — ip $_localIp'),
+  //         ],
+  //       ),
+  //     ),
+  //   );
+  // }
 
   Widget _radar() {
     return LayoutBuilder(
@@ -1451,7 +1516,11 @@ class _SandboxPageState extends State<SandboxPage> {
               ],
             ),
           if (_sceneLen > 0) _sceneRow(),
-          for (final s in _sources.where((d) => d.isFile)) _seekRow(s),
+          // Per-clip bars only for sources outside the authored score —
+          // scene sources are scrubbed by the master bar above.
+          for (final s
+              in _sources.where((d) => d.isFile && d.estDurS <= 0))
+            _seekRow(s),
           _sectionLabel('Scenes:'),
           const SizedBox(height: 6),
           Wrap(
