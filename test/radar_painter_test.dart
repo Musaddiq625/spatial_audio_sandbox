@@ -92,6 +92,28 @@ void main() {
     expect(levels.sourceLevel(7), greaterThan(0));
   });
 
+  test('paints the surround energy ribbon with live levels', () {
+    // Loud source ahead-left + quiet one behind: the ribbon must paint
+    // without throwing and take the per-source level path.
+    final dots = [
+      SourceDot(
+        id: 11,
+        kind: SourceKindWire.rain,
+        pos: const Offset(0.7, 0.7),
+        label: 'rain',
+      ),
+      SourceDot(
+        id: 12,
+        kind: SourceKindWire.bee,
+        pos: const Offset(-1.5, 0),
+        label: 'bee',
+      ),
+    ];
+    final levels = LevelsModel()..update(0.4, 0.1, [11, 12], [0.9, 0.05]);
+    paintRadar(sources: dots, levels: levels);
+    expect(levels.sourceLevel(11), greaterThan(0));
+  });
+
   test('LevelsModel ballistics: instant attack, smooth release, ILD', () {
     final m = LevelsModel();
     m.update(0.5, 0.05, const [], const []);

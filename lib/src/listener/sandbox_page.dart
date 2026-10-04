@@ -1859,9 +1859,27 @@ class _SandboxPageState extends State<SandboxPage> {
             if (_selectedPrompt != null)
               Padding(
                 padding: const EdgeInsets.only(top: 2),
-                child: Row(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    Builder(
+                    // The full prompt stays visible after selection —
+                    // the dropdown label truncates.
+                    Padding(
+                      padding: const EdgeInsets.only(left: 2),
+                      child: Text(
+                        _selectedPrompt!.prompt,
+                        maxLines: 3,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 10.5,
+                          fontStyle: FontStyle.italic,
+                          color: Color(0xFF7A8494),
+                        ),
+                      ),
+                    ),
+                    Row(
+                      children: [
+                        Builder(
                       builder: (context) {
                         final e = _selectedPrompt!;
                         final playing = _engineOn &&
@@ -1923,6 +1941,8 @@ class _SandboxPageState extends State<SandboxPage> {
                         ),
                         overflow: TextOverflow.ellipsis,
                       ),
+                    ),
+                      ],
                     ),
                   ],
                 ),
@@ -2369,6 +2389,62 @@ class RadarPainter extends CustomPainter {
       center + Offset(0, rMax),
       axisPaint,
     );
+
+    // ── surround energy ribbon: the rim swells toward loud azimuths —
+    // a surround meter without per-direction bars. Each live source
+    // spreads its real level over ~±25°; overlapping directions merge
+    // into one bulge. Silent scene → nothing drawn.
+    if (lvl != null) {
+      const n = 72;
+      const spread = 25.0 * math.pi / 180;
+      const baseR = 2.0;
+      final outer = <Offset>[];
+      final dirs = <Offset>[];
+      var eMax = 0.0;
+      for (var i = 0; i <= n; i++) {
+        final az = i * 2 * math.pi / n - math.pi;
+        var e = 0.0;
+        for (final s in sources) {
+          if (s.pending || s.ended || s.id == null) continue;
+          final l = lvl.sourceLevel(s.id!);
+          if (l <= 0.01) continue;
+          var d = az - math.atan2(s.pos.dy, s.pos.dx);
+          while (d > math.pi) {
+            d -= 2 * math.pi;
+          }
+          while (d < -math.pi) {
+            d += 2 * math.pi;
+          }
+          e += l * math.exp(-(d * d) / (2 * spread * spread));
+        }
+        if (e > eMax) eMax = e;
+        final r = rMax + baseR + 8.0 * e.clamp(0.0, 1.0);
+        // Same mapping as dots: azimuth 0 (front) → screen up.
+        dirs.add(Offset(-math.sin(az), -math.cos(az)));
+        outer.add(center + dirs.last * r);
+      }
+      if (eMax > 0.03) {
+        final band = Path()..addPolygon(outer, false);
+        for (var i = outer.length - 1; i >= 0; i--) {
+          final p = center + dirs[i] * (rMax + baseR);
+          band.lineTo(p.dx, p.dy);
+        }
+        band.close();
+        canvas.drawPath(
+          band,
+          Paint()
+            ..color = const Color(0xFF64D8CB).withValues(alpha: 0.10),
+        );
+        canvas.drawPath(
+          Path()..addPolygon(outer, false),
+          Paint()
+            ..color = const Color(0xFF64D8CB).withValues(alpha: 0.35)
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 1.5
+            ..strokeJoin = StrokeJoin.round,
+        );
+      }
+    }
 
     // ── compass + heading readout.
     const compassStyle = TextStyle(
