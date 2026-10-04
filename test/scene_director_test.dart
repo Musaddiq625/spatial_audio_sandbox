@@ -116,4 +116,25 @@ void main() {
     expect(tr.distM, 0.3);
     expect(tr.seconds, 30);
   });
+
+  test('repairs a response truncated mid-source (max_tokens hit)', () {
+    // Cut mid-way through the third source object — the two complete
+    // ones survive, the partial one is dropped.
+    final truncated = '{"sources":['
+        '{"name":"wind","kind":"noise","az":0,"dist":8},'
+        '{"name":"kids","kind":"noise","az":180,"dist":4},'
+        '{"name":"dragon","kind":"noise","az":0,"motion":{"traver';
+    final s = SceneDirector.parseSpec(truncated);
+    expect(s.sources.length, 2);
+    expect(s.sources[1].name, 'kids');
+  });
+
+  test('rejects truncation with no complete source', () {
+    // Nested braces exist but no source object ever closed — repair
+    // finds nothing to keep.
+    expect(
+      () => SceneDirector.parseSpec('{"sources":[{"a":{"b":1}'),
+      throwsA(isA<SpecException>()),
+    );
+  });
 }

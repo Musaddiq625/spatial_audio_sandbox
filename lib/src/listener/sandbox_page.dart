@@ -53,6 +53,8 @@ class _PromptEntry {
   _PromptEntry(this.prompt);
   final String prompt;
   SceneSpec? spec;
+  final startedAt = DateTime.now();
+  double? specSeconds; // filled when the spec lands
 
   Map<String, Object?> toJson() => {
     'prompt': prompt,
@@ -501,6 +503,12 @@ class _SandboxPageState extends State<SandboxPage> {
       dot.fileDurS = info.durationS;
       dot.fileT0 = DateTime.now();
       debugPrint('[sfx] ${dot.label}: file source live (id ${dot.id}, ${info.durationS.toStringAsFixed(1)}s)');
+      // First generated clip → open its seekbar so the feature is
+      // discoverable without needing to know chips are tappable.
+      if (mounted && _seekTarget == null && !_seekAutoShown) {
+        _seekAutoShown = true;
+        _selectSeek(dot);
+      }
     } catch (e) {
       debugPrint('[sfx] ${dot.label}: addFileSource failed — $e');
       _toast('file source failed: $e');
@@ -511,6 +519,8 @@ class _SandboxPageState extends State<SandboxPage> {
   /// clips have a meaningful timeline (procedural kinds don't).
   SourceDot? _seekTarget;
   Timer? _seekTicker;
+  bool _seekAutoShown = false; // auto-open once; don't re-open after a
+  // deliberate close when later clips land
 
   void _selectSeek(SourceDot s) {
     setState(() => _seekTarget = _seekTarget == s ? null : s);
@@ -599,13 +609,10 @@ class _SandboxPageState extends State<SandboxPage> {
   }
 
   void _sfxStatus(String name, SfxStatus status) {
-    switch (status) {
-      case SfxStatus.generating:
-        break; // the prompt chip already spins
-      case SfxStatus.ready:
-        _toast('$name ready');
-      case SfxStatus.failed:
-        _toast('$name: generation failed');
+    // No per-source toasts — the logs, the landed file chip, and the
+    // auto-opened seekbar already show progress. Failures still toast.
+    if (status == SfxStatus.failed) {
+      _toast('$name: generation failed');
     }
   }
 
@@ -695,6 +702,8 @@ class _SandboxPageState extends State<SandboxPage> {
       if (entry.spec == null) {
         _prompts.remove(entry);
       } else {
+        entry.specSeconds =
+            DateTime.now().difference(entry.startedAt).inMilliseconds / 1000;
         _promptCtl.clear();
         unawaited(_savePrompts());
       }
@@ -1103,33 +1112,58 @@ class _SandboxPageState extends State<SandboxPage> {
             ],
           ),
           if (_prompts.isNotEmpty)
-            Wrap(
-              spacing: 6,
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                for (final e in _prompts)
-                  e.spec == null
-                      ? Chip(
-                          visualDensity: VisualDensity.compact,
-                          avatar: const SizedBox(
-                            width: 12,
-                            height: 12,
-                            child: CircularProgressIndicator(strokeWidth: 2),
+                for (final e in _prompts.reversed)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 3),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        e.spec == null
+                            ? Chip(
+                                visualDensity: VisualDensity.compact,
+                                avatar: const SizedBox(
+                                  width: 12,
+                                  height: 12,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                  ),
+                                ),
+                                label: Text(
+                                  _promptLabel(e.prompt),
+                                  style: const TextStyle(fontSize: 11),
+                                ),
+                              )
+                            : ActionChip(
+                                visualDensity: VisualDensity.compact,
+                                tooltip: e.prompt,
+                                avatar: const Icon(
+                                  Icons.auto_awesome,
+                                  size: 14,
+                                ),
+                                label: Text(
+                                  _promptLabel(e.prompt),
+                                  style: const TextStyle(fontSize: 11),
+                                ),
+                                onPressed: () => _replay(e),
+                              ),
+                        const SizedBox(width: 6),
+                        Text(
+                          e.spec == null
+                              ? 'Gemma… ${DateTime.now().difference(e.startedAt).inSeconds}s'
+                              : e.specSeconds != null
+                                  ? 'spec in ${e.specSeconds!.toStringAsFixed(0)}s'
+                                  : 'saved',
+                          style: const TextStyle(
+                            fontSize: 10,
+                            color: Color(0xFF9AA4B2),
                           ),
-                          label: Text(
-                            _promptLabel(e.prompt),
-                            style: const TextStyle(fontSize: 11),
-                          ),
-                        )
-                      : ActionChip(
-                          visualDensity: VisualDensity.compact,
-                          tooltip: e.prompt,
-                          avatar: const Icon(Icons.auto_awesome, size: 14),
-                          label: Text(
-                            _promptLabel(e.prompt),
-                            style: const TextStyle(fontSize: 11),
-                          ),
-                          onPressed: () => _replay(e),
                         ),
+                      ],
+                    ),
+                  ),
               ],
             ),
           if (_seekTarget != null && _sources.contains(_seekTarget))

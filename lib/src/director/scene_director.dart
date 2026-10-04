@@ -425,11 +425,44 @@ class SceneDirector {
     if (start < 0 || end <= start) {
       throw SpecException('no JSON object in output');
     }
-    final Object? decoded;
+    Object? decoded;
+    var slice = cleaned.substring(start, end + 1);
     try {
-      decoded = jsonDecode(cleaned.substring(start, end + 1));
+      decoded = jsonDecode(slice);
     } catch (_) {
-      throw SpecException('malformed JSON');
+      // Truncated output repair: cut at the last complete source object
+      // (depth returns to 2 — inside the sources array) and close it.
+      var depth = 0, lastGood = -1;
+      var inStr = false, esc = false;
+      for (var i = 0; i < slice.length; i++) {
+        final ch = slice[i];
+        if (esc) {
+          esc = false;
+          continue;
+        }
+        if (ch == '\\') {
+          if (inStr) esc = true;
+          continue;
+        }
+        if (ch == '"') {
+          inStr = !inStr;
+          continue;
+        }
+        if (inStr) continue;
+        if (ch == '{' || ch == '[') depth++;
+        if (ch == '}' || ch == ']') {
+          depth--;
+          if (depth == 2 && ch == '}') lastGood = i;
+        }
+      }
+      if (lastGood < 0) throw SpecException('malformed JSON');
+      final repaired = '${slice.substring(0, lastGood + 1)}]}';
+      try {
+        decoded = jsonDecode(repaired);
+        debugPrint('[director] repaired truncated JSON (kept sources before cutoff)');
+      } catch (_) {
+        throw SpecException('malformed JSON');
+      }
     }
     if (decoded is! Map || decoded['sources'] is! List) {
       throw SpecException('missing "sources" array');
@@ -511,6 +544,7 @@ class SceneDirector {
     'properties': {
       'sources': {
         'type': 'array',
+        'maxItems': 8,
         'items': {
           'type': 'object',
           'properties': {
@@ -542,7 +576,7 @@ You are the scene director for a binaural audio app. Turn the user's description
 
 Kinds: bee (any buzzing insect — fly, mosquito, wasp), rain (steady hiss+droplets, good surround bed), pad (warm slow chord), tone (pure sine), noise (static/wind/ocean/waterfall texture). Map fanciful requests to the nearest kind ("ocean"→noise, "campfire"→noise, "meditation"→pad).
 
-Coordinates: az=0 front, +90 left, -90 right, ±180 behind. el=+deg above the head plane. dist in meters (0.3 close-up … 30 far). Max 8 sources. Orbit periods ≥4s or the spatial image smears. Words like "behind"/"left"/"above" must be reflected in az/el.
+Coordinates: az=0 front, +90 left, -90 right, ±180 behind. el=+deg above the head plane. dist in meters (0.3 close-up … 30 far). At most 6 sources, and ONLY ones the user actually described — never add filler sources they didn't mention. Name each source after the thing making the sound ("dragon", "kids", "helicopter") — never after a kind name ("pad", "tone", "noise" are forbidden as names). Orbit periods ≥4s or the spatial image smears. Words like "behind"/"left"/"above" must be reflected in az/el.
 
 Per-source motion — whenever the user says a source orbits, approaches, flies past, or crosses space (left→right, front→behind, sweeping by), you MUST attach a "motion" object to that source: "motion":{"orbit":{"radius":m,"period_s":s}} for circling, "motion":{"approach":{"from_az":deg,"from_dist":m,"seconds":s}} for a source flying toward the listener, or "motion":{"traverse":{"from_az":deg,"to_az":deg,"dist":m,"seconds":s}} for a source crossing space. A source described as moving but left without "motion" is a bug — static sources have no "motion" key.
 
