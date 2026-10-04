@@ -47,7 +47,7 @@ class LlmClient {
           {'role': 'user', 'content': user},
         ],
         'temperature': 0.2,
-        'max_tokens': 1024,
+        'max_tokens': 1536,
         'stream': true,
         if (jsonSchema != null)
           'response_format': {

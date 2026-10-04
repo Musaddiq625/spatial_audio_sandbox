@@ -358,7 +358,7 @@ class _SandboxPageState extends State<SandboxPage> {
       _engineOn = false;
       _info = null;
     });
-    _clearSeek();
+    _syncSeekTicker();
   }
 
   Future<void> _startEngine() async {
@@ -396,6 +396,7 @@ class _SandboxPageState extends State<SandboxPage> {
         _engineOn = true;
         _info = info;
       });
+      _syncSeekTicker(); // file sources re-added — playheads ticking again
     } catch (e) {
       _toast('engine start failed: $e');
     }
@@ -488,6 +489,7 @@ class _SandboxPageState extends State<SandboxPage> {
     final dot = key as SourceDot;
     dot.fileBytes = bytes;
     dot.looping = looping;
+    _syncSeekTicker(); // isFile just flipped — its row should appear
     if (!_engineOn) return;
     try {
       removeSource(id: dot.id);
@@ -503,39 +505,27 @@ class _SandboxPageState extends State<SandboxPage> {
       dot.fileDurS = info.durationS;
       dot.fileT0 = DateTime.now();
       debugPrint('[sfx] ${dot.label}: file source live (id ${dot.id}, ${info.durationS.toStringAsFixed(1)}s)');
-      // First generated clip → open its seekbar so the feature is
-      // discoverable without needing to know chips are tappable.
-      if (mounted && _seekTarget == null && !_seekAutoShown) {
-        _seekAutoShown = true;
-        _selectSeek(dot);
-      }
     } catch (e) {
       debugPrint('[sfx] ${dot.label}: addFileSource failed — $e');
       _toast('file source failed: $e');
     }
   }
 
-  /// The file source currently shown on the seekbar — only generated
-  /// clips have a meaningful timeline (procedural kinds don't).
-  SourceDot? _seekTarget;
+  /// One seekbar row per generated clip — a live mini-timeline of every
+  /// file source's playhead (procedural kinds have no timeline to show).
+  /// Ticks while at least one file source exists and the engine runs.
   Timer? _seekTicker;
-  bool _seekAutoShown = false; // auto-open once; don't re-open after a
-  // deliberate close when later clips land
 
-  void _selectSeek(SourceDot s) {
-    setState(() => _seekTarget = _seekTarget == s ? null : s);
-    _seekTicker?.cancel();
-    if (_seekTarget != null) {
-      _seekTicker = Timer.periodic(const Duration(milliseconds: 250), (_) {
+  void _syncSeekTicker() {
+    if (_engineOn && _sources.any((s) => s.isFile)) {
+      _seekTicker ??= Timer.periodic(const Duration(milliseconds: 250), (_) {
         if (mounted) setState(() {});
       });
+    } else {
+      _seekTicker?.cancel();
+      _seekTicker = null;
     }
-  }
-
-  void _clearSeek() {
-    _seekTarget = null;
-    _seekTicker?.cancel();
-    _seekTicker = null;
+    if (mounted) setState(() {});
   }
 
   /// Estimated playhead position — local clock, wraps for loops,
@@ -574,7 +564,7 @@ class _SandboxPageState extends State<SandboxPage> {
           ),
           Expanded(
             child: SizedBox(
-              height: 20,
+              height: 24,
               child: SliderTheme(
                 data: SliderTheme.of(context).copyWith(
                   trackHeight: 2,
@@ -619,8 +609,8 @@ class _SandboxPageState extends State<SandboxPage> {
   void _directedRemove(Object key) {
     final dot = key as SourceDot;
     removeSource(id: dot.id);
-    if (_seekTarget == dot) _clearSeek();
     setState(() => _sources.remove(dot));
+    _syncSeekTicker();
   }
 
   // key is the SourceDot — its engine id is read live, so motion ticks
@@ -732,14 +722,14 @@ class _SandboxPageState extends State<SandboxPage> {
     }
     _sources.clear();
     _director.reset();
-    _clearSeek();
+    _syncSeekTicker();
     setState(() {});
   }
 
   void _removeSource(SourceDot s) {
     removeSource(id: s.id);
-    if (_seekTarget == s) _clearSeek();
     setState(() => _sources.remove(s));
+    _syncSeekTicker();
   }
 
   void _recenter() {
@@ -760,7 +750,19 @@ class _SandboxPageState extends State<SandboxPage> {
 
   double get _displayYaw => _displayYawRaw() - _yawAtRecenter;
 
+  String? _lastToast;
+  DateTime _lastToastAt = DateTime.fromMillisecondsSinceEpoch(0);
+
   void _toast(String msg) {
+    // One prompt can trigger the same toast per source (e.g. "start the
+    // engine first" × N sources) — dedup identical messages in a window.
+    final now = DateTime.now();
+    if (msg == _lastToast &&
+        now.difference(_lastToastAt) < const Duration(seconds: 3)) {
+      return;
+    }
+    _lastToast = msg;
+    _lastToastAt = now;
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text(msg), duration: const Duration(seconds: 2)),
     );
@@ -1166,8 +1168,7 @@ class _SandboxPageState extends State<SandboxPage> {
                   ),
               ],
             ),
-          if (_seekTarget != null && _sources.contains(_seekTarget))
-            _seekRow(_seekTarget!),
+          for (final s in _sources.where((d) => d.isFile)) _seekRow(s),
           _sectionLabel('Scenes:'),
           const SizedBox(height: 6),
           Wrap(
@@ -1205,8 +1206,6 @@ class _SandboxPageState extends State<SandboxPage> {
                     avatar: s.isFile
                         ? const Icon(Icons.audio_file, size: 14)
                         : null,
-                    selected: _seekTarget == s,
-                    onPressed: s.isFile ? () => _selectSeek(s) : null,
                     deleteIcon: const Icon(Icons.close, size: 16),
                     onDeleted: () => _removeSource(s),
                     visualDensity: VisualDensity.compact,
