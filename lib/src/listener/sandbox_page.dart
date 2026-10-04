@@ -1486,6 +1486,24 @@ class _SandboxPageState extends State<SandboxPage> {
       ),
       body: Column(
         children: [
+          // Headphone hint — the demo reads wrong on speakers; also
+          // explains the app to anyone watching a screen recording.
+          Container(
+            width: double.infinity,
+            color: const Color(0xFF16202B),
+            padding: const EdgeInsets.symmetric(vertical: 3),
+            child: const Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(Icons.headphones, size: 13, color: Color(0xFF64D8CB)),
+                SizedBox(width: 6),
+                Text(
+                  'Wear headphones — sounds play around you in 3D',
+                  style: TextStyle(fontSize: 11, color: Color(0xFF9AA4B2)),
+                ),
+              ],
+            ),
+          ),
           // _infoBar(),
           Expanded(child: _radar()),
           _legend(),
@@ -1942,6 +1960,20 @@ class _SandboxPageState extends State<SandboxPage> {
           for (final s
               in _sources.where((d) => d.isFile && d.estDurS <= 0))
             _seekRow(s),
+          const Padding(
+            padding: EdgeInsets.only(top: 10, bottom: 2),
+            child: Center(
+              child: Text(
+                'Built with ❤️\nby Musaddiq625',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 10,
+                  color: Color(0xFF5A6470),
+                  height: 1.3,
+                ),
+              ),
+            ),
+          ),
         ],
       ),
     );
