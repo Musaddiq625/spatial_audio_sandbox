@@ -93,6 +93,9 @@ pub struct PoseTracker {
     angvel: Vec3,
     /// Extra forward prediction in seconds (e.g. measured BT output latency).
     pub predict_secs: f32,
+    /// Flatten the published head pose to its yaw (gravity twist) only —
+    /// tilts and in-hand rolls then can't swing the scene's azimuth.
+    pub yaw_only: bool,
 }
 
 impl PoseTracker {
@@ -108,6 +111,7 @@ impl PoseTracker {
             raw: Quat::IDENTITY,
             angvel: Vec3::ZERO,
             predict_secs: 0.0,
+            yaw_only: false,
         }
     }
 
@@ -125,6 +129,16 @@ impl PoseTracker {
             let neg = Vec3::new(-self.angvel.x, -self.angvel.y, -self.angvel.z);
             let pred = Quat::from_angvel(neg, self.predict_secs);
             head = pred.mul(head).normalized();
+        }
+        if self.yaw_only {
+            // Keep only the twist about gravity (+z): normalize the
+            // (w, z) part of the quaternion. A tilted in-hand roll has
+            // little z-twist, so it stops swinging the image — this is
+            // the honest yaw component of the rotation.
+            let n = (head.w * head.w + head.z * head.z).sqrt();
+            if n > 1e-6 {
+                head = Quat::new(head.w / n, 0.0, 0.0, head.z / n);
+            }
         }
         self.slot.write(Pose { head, raw: self.raw });
     }
@@ -176,5 +190,31 @@ mod tests {
         // front source should appear left of center.
         let d = head.rotate(Vec3::new(1.0, 0.0, 0.0));
         assert!(d.y > 0.05, "prediction should push source left, got {d:?}");
+    }
+
+    /// yaw_only flattens pitch/roll but keeps heading: a phone tilted
+    /// forward must not swing the scene's azimuth or kill its yaw.
+    #[test]
+    fn yaw_only_drops_tilt_keeps_heading() {
+        let slot = Arc::new(PoseSlot::new());
+        let mut tracker = PoseTracker::new(slot.clone());
+        tracker.yaw_only = true;
+        // Pure pitch (nod up 90 deg): no z-twist, head flattens to identity.
+        let p = Quat::new(
+            std::f32::consts::FRAC_PI_4.cos(),
+            std::f32::consts::FRAC_PI_4.sin(),
+            0.0,
+            0.0,
+        );
+        tracker.update(p.w, p.x, p.y, p.z, 0.0, 0.0, 0.0);
+        let head = slot.read().head;
+        let d = head.rotate(Vec3::new(1.0, 0.0, 0.0));
+        assert!(d.x > 0.99 && d.z.abs() < 0.05, "pitch flattened away: {d:?}");
+        // Yaw survives: turned right 90 deg, front still maps left.
+        let q = Quat::yaw(-FRAC_PI_2);
+        tracker.update(q.w, q.x, q.y, q.z, 0.0, 0.0, 0.0);
+        let head = slot.read().head;
+        let d = head.rotate(Vec3::new(1.0, 0.0, 0.0));
+        assert!(d.y > 0.99, "yaw preserved in yaw_only: {d:?}");
     }
 }

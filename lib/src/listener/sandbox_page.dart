@@ -180,6 +180,7 @@ class _SandboxPageState extends State<SandboxPage> {
   // double _predictMs = 0;
   double _virtualYaw = 0; // radians, desktop fallback
   double _yawAtRecenter = 0;
+  bool _yawOnly = false; // head tracking mode: false = full 3D
   int _nextPaletteIdx = 0;
   Timer? _statsTimer;
   final _promptCtl = TextEditingController();
@@ -409,9 +410,18 @@ class _SandboxPageState extends State<SandboxPage> {
     _syncSeekTicker();
   }
 
+  /// Latch the current device orientation as "facing forward" — engine
+  /// pose AND radar heading, so they can never disagree.
+  void _applyRecenter() {
+    recenter();
+    _yawAtRecenter = _displayYawRaw();
+    _virtualYaw = 0;
+  }
+
   Future<void> _startEngine() async {
     try {
       final info = await engineStart();
+      _applyRecenter(); // engine start = "forward is where I face now"
       // Fresh engine has no sources — re-add local dots and linked beacons.
       for (final s in _sources) {
         if (s.pending) continue; // not due — the ticker realizes it
@@ -693,6 +703,8 @@ class _SandboxPageState extends State<SandboxPage> {
     _scrubbing = false; // a stale drag must not commit onto the new scene
     _scrubT = null;
     _pausedT = null; // a fresh scene is never born paused
+    // A new scene assumes you're facing the way you want "front" to be.
+    _applyRecenter();
   }
 
   void _syncSeekTicker() {
@@ -1246,12 +1258,6 @@ class _SandboxPageState extends State<SandboxPage> {
     _syncSeekTicker();
   }
 
-  // void _recenter() {
-  //   recenter();
-  //   _yawAtRecenter = _displayYawRaw();
-  //   _virtualYaw = 0;
-  // }
-
   double _displayYawRaw() {
     final q = _pose.lastQuat.value;
     if (q == null) return _virtualYaw;
@@ -1296,11 +1302,24 @@ class _SandboxPageState extends State<SandboxPage> {
           style: TextStyle(fontSize: 16),
         ),
         actions: [
-          // IconButton(
-          //   tooltip: 'recenter head',
-          //   onPressed: _recenter,
-          //   icon: const Icon(Icons.center_focus_strong),
-          // ),
+          IconButton(
+            tooltip: _yawOnly
+                ? 'head tracking: yaw only (tap for full 3D)'
+                : 'head tracking: full 3D (tap for yaw only)',
+            onPressed: () {
+              setState(() => _yawOnly = !_yawOnly);
+              setYawOnly(yawOnly: _yawOnly);
+            },
+            icon: Icon(
+              _yawOnly ? Icons.screen_rotation : Icons.threed_rotation,
+              size: 20,
+            ),
+          ),
+          IconButton(
+            tooltip: 'recenter head',
+            onPressed: _applyRecenter,
+            icon: const Icon(Icons.center_focus_strong, size: 20),
+          ),
           Padding(
             padding: const EdgeInsets.only(right: 8),
             child: FilledButton.tonalIcon(

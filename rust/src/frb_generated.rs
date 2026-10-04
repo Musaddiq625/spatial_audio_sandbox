@@ -39,7 +39,7 @@ flutter_rust_bridge::frb_generated_boilerplate!(
     default_rust_auto_opaque = RustAutoOpaqueMoi,
 );
 pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_VERSION: &str = "2.13.0";
-pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = -1419723640;
+pub(crate) const FLUTTER_RUST_BRIDGE_CODEGEN_CONTENT_HASH: i32 = 948981869;
 
 // Section: executor
 
@@ -664,6 +664,38 @@ fn wire__crate__api__engine__set_source_position_impl(
         },
     )
 }
+fn wire__crate__api__engine__set_yaw_only_impl(
+    ptr_: flutter_rust_bridge::for_generated::PlatformGeneralizedUint8ListPtr,
+    rust_vec_len_: i32,
+    data_len_: i32,
+) -> flutter_rust_bridge::for_generated::WireSyncRust2DartSse {
+    FLUTTER_RUST_BRIDGE_HANDLER.wrap_sync::<flutter_rust_bridge::for_generated::SseCodec, _>(
+        flutter_rust_bridge::for_generated::TaskInfo {
+            debug_name: "set_yaw_only",
+            port: None,
+            mode: flutter_rust_bridge::for_generated::FfiCallMode::Sync,
+        },
+        move || {
+            let message = unsafe {
+                flutter_rust_bridge::for_generated::Dart2RustMessageSse::from_wire(
+                    ptr_,
+                    rust_vec_len_,
+                    data_len_,
+                )
+            };
+            let mut deserializer =
+                flutter_rust_bridge::for_generated::SseDeserializer::new(message);
+            let api_yaw_only = <bool>::sse_decode(&mut deserializer);
+            deserializer.end();
+            transform_result_sse::<_, ()>((move || {
+                let output_ok = Ok::<_, ()>({
+                    crate::api::engine::set_yaw_only(api_yaw_only);
+                })?;
+                std::result::Result::Ok(output_ok)
+            })())
+        },
+    )
+}
 
 // Section: dart2rust
 
@@ -860,6 +892,7 @@ fn pde_ffi_dispatcher_sync_impl(
         15 => wire__crate__api__engine__set_predict_ms_impl(ptr, rust_vec_len, data_len),
         16 => wire__crate__api__engine__set_source_gain_impl(ptr, rust_vec_len, data_len),
         17 => wire__crate__api__engine__set_source_position_impl(ptr, rust_vec_len, data_len),
+        18 => wire__crate__api__engine__set_yaw_only_impl(ptr, rust_vec_len, data_len),
         _ => unreachable!(),
     }
 }

@@ -67,7 +67,7 @@ class RustLib extends BaseEntrypoint<RustLibApi, RustLibApiImpl, RustLibWire> {
   String get codegenVersion => '2.13.0';
 
   @override
-  int get rustContentHash => -1419723640;
+  int get rustContentHash => 948981869;
 
   static const kDefaultExternalLibraryLoaderConfig =
       ExternalLibraryLoaderConfig(
@@ -152,6 +152,8 @@ abstract class RustLibApi extends BaseApi {
     required double y,
     required double z,
   });
+
+  void crateApiEngineSetYawOnly({required bool yawOnly});
 }
 
 class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
@@ -684,6 +686,29 @@ class RustLibApiImpl extends RustLibApiImplPlatform implements RustLibApi {
         debugName: "set_source_position",
         argNames: ["id", "x", "y", "z"],
       );
+
+  @override
+  void crateApiEngineSetYawOnly({required bool yawOnly}) {
+    return handler.executeSync(
+      SyncTask(
+        callFfi: () {
+          final serializer = SseSerializer(generalizedFrbRustBinding);
+          sse_encode_bool(yawOnly, serializer);
+          return pdeCallFfi(generalizedFrbRustBinding, serializer, funcId: 18)!;
+        },
+        codec: SseCodec(
+          decodeSuccessData: sse_decode_unit,
+          decodeErrorData: null,
+        ),
+        constMeta: kCrateApiEngineSetYawOnlyConstMeta,
+        argValues: [yawOnly],
+        apiImpl: this,
+      ),
+    );
+  }
+
+  TaskConstMeta get kCrateApiEngineSetYawOnlyConstMeta =>
+      const TaskConstMeta(debugName: "set_yaw_only", argNames: ["yawOnly"]);
 
   @protected
   AnyhowException dco_decode_AnyhowException(dynamic raw) {

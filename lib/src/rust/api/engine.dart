@@ -47,6 +47,11 @@ void recenter() => RustLib.instance.api.crateApiEngineRecenter();
 void setPredictMs({required double ms}) =>
     RustLib.instance.api.crateApiEngineSetPredictMs(ms: ms);
 
+/// Restrict head tracking to yaw (heading about gravity): tilts and
+/// in-hand rolls stop swinging the scene's azimuth. Toggleable live.
+void setYawOnly({required bool yawOnly}) =>
+    RustLib.instance.api.crateApiEngineSetYawOnly(yawOnly: yawOnly);
+
 Future<int> addSource({
   required SourceKindWire kind,
   required double x,

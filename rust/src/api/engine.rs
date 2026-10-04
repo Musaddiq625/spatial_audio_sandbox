@@ -215,6 +215,16 @@ pub fn set_predict_ms(ms: f32) {
     }
 }
 
+/// Restrict head tracking to yaw (heading about gravity): tilts and
+/// in-hand rolls stop swinging the scene's azimuth. Toggleable live.
+#[flutter_rust_bridge::frb(sync)]
+pub fn set_yaw_only(yaw_only: bool) {
+    if let Ok(mut t) = tracker().lock() {
+        t.yaw_only = yaw_only;
+        t.refresh();
+    }
+}
+
 pub fn add_source(kind: SourceKindWire, x: f32, y: f32, z: f32, gain: f32) -> Result<u32> {
     let mut st = state().lock().map_err(|_| anyhow!("state poisoned"))?;
     let id = st.next_id;

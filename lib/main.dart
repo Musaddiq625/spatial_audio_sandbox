@@ -1,11 +1,13 @@
 import 'dart:ui';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:spatial_audio_sandbox/src/rust/frb_generated.dart';
 import 'package:spatial_audio_sandbox/src/listener/sandbox_page.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
   FlutterError.onError = (details) {
     FlutterError.presentError(details);
     debugPrint('[crash] ${details.exceptionAsString()}\n${details.stack}');
