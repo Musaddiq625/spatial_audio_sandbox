@@ -3,7 +3,7 @@
 
 #![cfg(target_os = "android")]
 
-use crate::mix::{Cmd, Mixer};
+use crate::mix::Mixer;
 use crate::pose::PoseSlot;
 use crate::rt::{Engine, EngineInfo, StreamGuard};
 use crate::SAMPLE_RATE;
@@ -47,7 +47,7 @@ impl AudioOutputCallback for Cb {
 }
 
 pub fn start(pose: Arc<PoseSlot>) -> Result<Engine, String> {
-    let (mixer, cmd_tx, trash_rx) = Mixer::new(SAMPLE_RATE, pose.clone());
+    let (mixer, cmd_tx, trash_rx, diag_status) = Mixer::new(SAMPLE_RATE, pose.clone());
 
     let mut stream = AudioStreamBuilder::default()
         .set_output()
@@ -81,5 +81,5 @@ pub fn start(pose: Arc<PoseSlot>) -> Result<Engine, String> {
     };
 
     stream.request_start().map_err(|e| format!("oboe start failed: {e:?}"))?;
-    Ok(Engine::assemble(info, cmd_tx, trash_rx, pose, Box::new(Guard { stream })))
+    Ok(Engine::assemble(info, cmd_tx, trash_rx, diag_status, pose, Box::new(Guard { stream })))
 }

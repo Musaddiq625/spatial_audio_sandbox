@@ -69,6 +69,53 @@ void setSpatialParams({
 void setYawOnly({required bool yawOnly}) =>
     RustLib.instance.api.crateApiEngineSetYawOnly(yawOnly: yawOnly);
 
+/// Enter a diagnostic session. Fades the scene out and freezes every
+/// normal source (playheads preserved for the exit).
+void diagEnter({required int token}) =>
+    RustLib.instance.api.crateApiEngineDiagEnter(token: token);
+
+/// End the session — normal sources fade back in. Idempotent.
+void diagExit({required int token}) =>
+    RustLib.instance.api.crateApiEngineDiagExit(token: token);
+
+/// Start or replace a bounded trial (~1.15 s chime pair). `az` radians,
+/// + = left (spatial mode); `level` 0..1.5; `balance` -1..1 (direct).
+void diagPlay({
+  required int token,
+  required int trial,
+  required bool direct,
+  required double az,
+  required double level,
+  required double balance,
+}) => RustLib.instance.api.crateApiEngineDiagPlay(
+  token: token,
+  trial: trial,
+  direct: direct,
+  az: az,
+  level: level,
+  balance: balance,
+);
+
+/// Stop the current trial; the session stays open. Idempotent.
+void diagStop({required int token}) =>
+    RustLib.instance.api.crateApiEngineDiagStop(token: token);
+
+/// Live-tune volume/balance/position mid-trial.
+void diagParams({
+  required int token,
+  required double az,
+  required double level,
+  required double balance,
+}) => RustLib.instance.api.crateApiEngineDiagParams(
+  token: token,
+  az: az,
+  level: level,
+  balance: balance,
+);
+
+/// Poll at UI cadence — never per-frame.
+DiagStatusWire diagStatus() => RustLib.instance.api.crateApiEngineDiagStatus();
+
 Future<int> addSource({
   required SourceKindWire kind,
   required double x,
@@ -167,6 +214,36 @@ Future<void> renderStaticWav({
   elevDeg: elevDeg,
   distM: distM,
 );
+
+/// Diagnostic status snapshot for the UI.
+class DiagStatusWire {
+  /// Session token while a session is open, else 0.
+  final int session;
+
+  /// Currently sounding trial id, else 0.
+  final int trial;
+
+  /// Ms left in the current trial, else 0.
+  final int remainingMs;
+
+  const DiagStatusWire({
+    required this.session,
+    required this.trial,
+    required this.remainingMs,
+  });
+
+  @override
+  int get hashCode => session.hashCode ^ trial.hashCode ^ remainingMs.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is DiagStatusWire &&
+          runtimeType == other.runtimeType &&
+          session == other.session &&
+          trial == other.trial &&
+          remainingMs == other.remainingMs;
+}
 
 /// Mirror of `sas_engine::rt::EngineInfo` for codegen (all-owned types).
 class EngineInfoWire {

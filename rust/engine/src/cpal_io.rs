@@ -32,7 +32,7 @@ pub fn start(pose: Arc<PoseSlot>) -> Result<Engine, String> {
     // Ask for the smallest stable buffer: fixed small buffer size.
     cfg.buffer_size = cpal::BufferSize::Fixed(256);
 
-    let (mut mixer, cmd_tx, trash_rx) = Mixer::new(SAMPLE_RATE, pose.clone());
+    let (mut mixer, cmd_tx, trash_rx, diag_status) = Mixer::new(SAMPLE_RATE, pose.clone());
 
     let err_fn = |e| eprintln!("[sas_engine] cpal stream error: {e}");
     let stream = device
@@ -65,5 +65,5 @@ pub fn start(pose: Arc<PoseSlot>) -> Result<Engine, String> {
         sharing_mode: "n/a (desktop)".to_string(),
         latency_ms: None,
     };
-    Ok(Engine::assemble(info, cmd_tx, trash_rx, pose, Box::new(Guard(stream))))
+    Ok(Engine::assemble(info, cmd_tx, trash_rx, diag_status, pose, Box::new(Guard(stream))))
 }

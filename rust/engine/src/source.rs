@@ -108,6 +108,89 @@ impl Source for Noise {
     }
 }
 
+/// Diagnostic chime: two 300 ms multi-tone bursts separated by 500 ms
+/// of silence — timing is counted in samples, not UI timers. Finite,
+/// deterministic, alloc-free.
+pub struct Chime {
+    pos: u64,       // samples elapsed
+    total: u64,     // total samples including a short tail
+    burst2_at: u64, // second burst start
+    burst_len: u64,
+    phase: [f32; 3],
+}
+
+impl Chime {
+    /// (freq Hz, weight) — a mid-band triad, clear on any transducer.
+    const FREQS: [(f32, f32); 3] = [(660.0, 1.0), (990.0, 0.55), (1_320.0, 0.35)];
+
+    pub fn new(sr: f32) -> Self {
+        Chime {
+            pos: 0,
+            burst_len: (0.300 * sr) as u64,
+            burst2_at: (0.800 * sr) as u64, // 300 ms on + 500 ms off
+            total: (1.150 * sr) as u64,     // 300 ms tail after the 2nd burst
+            phase: [0.0; 3],
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.pos = 0;
+        self.phase = [0.0; 3];
+    }
+
+    pub fn remaining_ms(&self, sr: f32) -> u32 {
+        (self.total.saturating_sub(self.pos) as f32 / sr * 1000.0) as u32
+    }
+
+    /// Raised-cosine envelope for the burst containing `local` samples.
+    fn env(local: u64, burst_len: u64, sr: f32) -> f32 {
+        let att = (0.030 * sr) as u64;
+        let rel = (0.060 * sr) as u64;
+        let l = local as f32;
+        let in_env = if l < att as f32 {
+            0.5 - 0.5 * (std::f32::consts::PI * l / att as f32).cos()
+        } else {
+            1.0
+        };
+        let rel_start = burst_len.saturating_sub(rel) as f32;
+        if l > rel_start && rel > 0 {
+            in_env * (0.5 + 0.5 * (std::f32::consts::PI * (l - rel_start) / rel as f32).cos())
+        } else {
+            in_env
+        }
+    }
+}
+
+impl Source for Chime {
+    fn tick(&mut self, sr: f32) -> f32 {
+        let p = self.pos;
+        self.pos += 1;
+        let in_b1 = p < self.burst_len;
+        let in_b2 = p >= self.burst2_at && p < self.burst2_at + self.burst_len;
+        if !(in_b1 || in_b2) {
+            // Advance phases anyway so a mid-silence restart keeps
+            // continuous phase; output is zero.
+            for (i, ph) in self.phase.iter_mut().enumerate() {
+                *ph = (*ph + Self::FREQS[i].0 / sr) % 1.0;
+            }
+            return 0.0;
+        }
+        let local = if in_b1 { p } else { p - self.burst2_at };
+        let e = Self::env(local, self.burst_len, sr);
+        let mut x = 0.0;
+        for (i, ph) in self.phase.iter_mut().enumerate() {
+            let (f, wgt) = Self::FREQS[i];
+            x += (2.0 * PI * *ph).sin() * wgt;
+            *ph = (*ph + f / sr) % 1.0;
+        }
+        x * e * 0.35
+    }
+
+    fn is_finished(&self) -> bool {
+        self.pos >= self.total
+    }
+}
+
 /// Single impulse then silence — impulse-response probe for tests.
 pub struct Click {
     fired: bool,

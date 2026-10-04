@@ -22,6 +22,13 @@ impl Fir {
         }
     }
 
+    /// Zero the delay line — clears the ringing tail without freeing
+    /// or reallocating. Allocation-free; safe on the audio thread.
+    pub fn reset(&mut self) {
+        self.state.fill(0.0);
+        self.pos = 0;
+    }
+
     #[inline]
     pub fn tick(&mut self, x: f32) -> f32 {
         self.state[self.pos] = x;
@@ -75,6 +82,20 @@ impl XFadeConvolver {
 
     /// First assignment without a fade (no audible tail to preserve).
     pub fn init_hrir(&mut self, h: &Hrir) {
+        self.a_l.set_coeffs(&h.left);
+        self.a_r.set_coeffs(&h.right);
+        self.fade = 0;
+    }
+
+    /// Fresh start on an existing convolver: clear all filter history
+    /// AND install `h`. `init_hrir` alone changes coefficients but
+    /// keeps the old sample history — a new diagnostic trial would
+    /// emit the previous trial's tail.
+    pub fn reset_to(&mut self, h: &Hrir) {
+        self.a_l.reset();
+        self.a_r.reset();
+        self.b_l.reset();
+        self.b_r.reset();
         self.a_l.set_coeffs(&h.left);
         self.a_r.set_coeffs(&h.right);
         self.fade = 0;

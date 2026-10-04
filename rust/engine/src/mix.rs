@@ -8,7 +8,8 @@ use crate::convolve::{Fir, XFadeConvolver};
 use crate::hrtf::SyntheticHrirSet;
 use crate::math::{Spherical, Vec3};
 use crate::pose::PoseSlot;
-use crate::source::{OnePole, Source, XorShift};
+use crate::source::{Chime, OnePole, Source, XorShift};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 /// Control→audio commands. `Add` carries the fully-built SourceState
@@ -28,6 +29,20 @@ pub enum Cmd {
     Seek { id: u32, pos_s: f32 },
     SetMaster { gain: f32 },
     SetWet { wet: f32 },
+    /// Enter a diagnostic session — carries a fully-built Diag (its
+    /// convolver buffers were allocated on the control thread). While
+    /// a session holds, normal sources freeze after a short fade.
+    DiagEnter(Diag),
+    /// End the session: the diagnostic fades out, then moves to the
+    /// trash ring; normal sources fade back in.
+    DiagExit { token: u32 },
+    /// Start or replace a bounded trial. `direct` = raw channel output
+    /// (headphone check); `!direct` = spatial HRTF path.
+    DiagPlay { token: u32, trial: u32, direct: bool, az: f32, level: f32, balance: f32 },
+    /// Stop the current trial (session stays open).
+    DiagStop { token: u32 },
+    /// Live-tune the current session (volume/balance/position).
+    DiagParams { token: u32, az: f32, level: f32, balance: f32 },
 }
 
 const MAX_SOURCES: usize = 16;
@@ -84,6 +99,81 @@ impl Cmd {
     pub fn add(id: u32, gen: Box<dyn Source>, pos: Vec3, gain: f32, sr: f32) -> Cmd {
         Cmd::Add(SourceState::new(id, gen, pos, gain, sr))
     }
+    /// Build a diagnostic-session command — allocates the convolver on
+    /// the caller's (control) thread, same contract as `add`.
+    pub fn diag_enter(token: u32, sr: f32) -> Cmd {
+        Cmd::DiagEnter(Diag::new(token, sr))
+    }
+}
+
+/// Retired state headed for the control thread via the trash ring —
+/// sources and diagnostic sessions both carry convolver buffers that
+/// must not be freed inside the audio callback.
+pub enum Trash {
+    Source(SourceState),
+    Diag(Diag),
+}
+
+/// A diagnostic session: one finite stimulus slot, rendered on top of
+/// a muted-and-frozen normal mix. `direct` mode writes channel-scaled
+/// mono straight to output (an ear-integrity check); spatial mode goes
+/// through the same HRTF convolution as scene sources.
+pub struct Diag {
+    pub token: u32,
+    pub trial: u32,
+    pub direct: bool,
+    pub az: f32,      // spatial azimuth (rad, + = left)
+    pub level: f32,   // test volume 0..1
+    pub balance: f32, // -1 left .. +1 right (direct mode only)
+    pub src: Chime,
+    conv: XFadeConvolver,
+    gain: f32,
+    gain_target: f32,
+    exiting: bool,
+}
+
+impl Diag {
+    /// Allocates convolver buffers — call on the control thread.
+    fn new(token: u32, sr: f32) -> Self {
+        Diag {
+            token,
+            trial: 0,
+            direct: true,
+            az: 0.0,
+            level: 0.8,
+            balance: 0.0,
+            src: Chime::new(sr),
+            conv: XFadeConvolver::new(),
+            gain: 0.0,
+            gain_target: 0.0,
+            exiting: false,
+        }
+    }
+}
+
+/// Audio→UI status for the diagnostic session — packed atomics, read
+/// at UI cadence (never per-frame).
+#[derive(Default)]
+pub struct DiagStatus {
+    session: AtomicU32,
+    trial: AtomicU32,
+    remaining_ms: AtomicU32,
+}
+
+impl DiagStatus {
+    pub fn read(&self) -> (u32, u32, u32) {
+        (
+            self.session.load(Ordering::Relaxed),
+            self.trial.load(Ordering::Relaxed),
+            self.remaining_ms.load(Ordering::Relaxed),
+        )
+    }
+
+    fn write(&self, session: u32, trial: u32, remaining_ms: u32) {
+        self.session.store(session, Ordering::Relaxed);
+        self.trial.store(trial, Ordering::Relaxed);
+        self.remaining_ms.store(remaining_ms, Ordering::Relaxed);
+    }
 }
 
 /// Sparse velvet-noise room tail + asymmetric early reflections. Deliberately
@@ -118,13 +208,21 @@ pub struct Mixer {
     hrir: SyntheticHrirSet,
     sources: Vec<SourceState>,
     cmd_rx: rtrb::Consumer<Cmd>,
-    /// Audio→control ring: removed/finished sources go here to be
+    /// Audio→control ring: removed/finished state goes here to be
     /// dropped on the control thread. Never blocks — overflow parks in
     /// `pending_trash` and retries next block.
-    trash_tx: rtrb::Producer<SourceState>,
-    /// Retired sources waiting for trash ring space. Preallocated so
+    trash_tx: rtrb::Producer<Trash>,
+    /// Retired state waiting for trash ring space. Preallocated so
     /// pushing is alloc-free on the callback.
-    pending_trash: Vec<SourceState>,
+    pending_trash: Vec<Trash>,
+    /// Active diagnostic session — normal sources freeze while held.
+    diag: Option<Diag>,
+    /// Normal-output gate: ramps 1→0 on session entry (fade the scene
+    /// out) and 0→1 on exit. Sources don't tick while fully gated, so
+    /// their playheads are preserved across the test.
+    norm_fade: f32,
+    /// Audio→control status snapshot for the diagnostic UI.
+    status: Arc<DiagStatus>,
     scratch: Vec<f32>,
     verb_l: Fir,
     verb_r: Fir,
@@ -144,9 +242,10 @@ impl Mixer {
     pub fn new(
         sr: f32,
         pose: Arc<PoseSlot>,
-    ) -> (Self, rtrb::Producer<Cmd>, rtrb::Consumer<SourceState>) {
+    ) -> (Self, rtrb::Producer<Cmd>, rtrb::Consumer<Trash>, Arc<DiagStatus>) {
         let (tx, rx) = rtrb::RingBuffer::<Cmd>::new(256);
-        let (ttx, trx) = rtrb::RingBuffer::<SourceState>::new(MAX_SOURCES);
+        let (ttx, trx) = rtrb::RingBuffer::<Trash>::new(MAX_SOURCES + 1);
+        let status = Arc::new(DiagStatus::default());
         let (il, ir) = build_room_irs(sr);
         let mut verb_l = Fir::new(128);
         verb_l.set_coeffs(&il);
@@ -160,7 +259,10 @@ impl Mixer {
                 sources: Vec::with_capacity(MAX_SOURCES),
                 cmd_rx: rx,
                 trash_tx: ttx,
-                pending_trash: Vec::with_capacity(MAX_SOURCES),
+                pending_trash: Vec::with_capacity(MAX_SOURCES + 1),
+                diag: None,
+                norm_fade: 1.0,
+                status: status.clone(),
                 scratch: vec![0.0; MAX_BLOCK],
                 verb_l,
                 verb_r,
@@ -172,6 +274,7 @@ impl Mixer {
             },
             tx,
             trx,
+            status,
         )
     }
 
@@ -190,7 +293,12 @@ impl Mixer {
     /// on the callback either way).
     fn retire(&mut self, i: usize) {
         let ss = self.sources.swap_remove(i);
-        if let Err(rtrb::PushError::Full(back)) = self.trash_tx.push(ss) {
+        self.trash_or_park(Trash::Source(ss));
+    }
+
+    /// Trash or park — alloc-free as long as `pending_trash` has room.
+    fn trash_or_park(&mut self, t: Trash) {
+        if let Err(rtrb::PushError::Full(back)) = self.trash_tx.push(t) {
             self.pending_trash.push(back);
         }
     }
@@ -248,6 +356,63 @@ impl Mixer {
             }
             Cmd::SetMaster { gain } => self.master = gain,
             Cmd::SetWet { wet } => self.wet = wet.clamp(0.0, 1.0),
+            Cmd::DiagEnter(d) => {
+                // Replace a live session — its buffers go to the trash
+                // ring, never freed in the callback.
+                if let Some(old) = self.diag.replace(d) {
+                    self.trash_or_park(Trash::Diag(old));
+                }
+            }
+            Cmd::DiagExit { token } => {
+                if let Some(d) = self.diag.as_mut() {
+                    if d.token == token {
+                        // Fade the trial out; the mixer retires the Diag
+                        // once its gain converges.
+                        d.exiting = true;
+                        d.gain_target = 0.0;
+                    }
+                }
+            }
+            Cmd::DiagPlay { token, trial, direct, az, level, balance } => {
+                if let Some(d) = self.diag.as_mut() {
+                    if d.token == token {
+                        d.trial = trial;
+                        d.direct = direct;
+                        d.level = level.clamp(0.0, 1.5);
+                        d.balance = balance.clamp(-1.0, 1.0);
+                        if !direct {
+                            // Fresh history for a fresh trial — no
+                            // leftover tail, no crossfade from the old az.
+                            d.az = az;
+                            let h = self.hrir.hrir(az, 0.0);
+                            d.conv.reset_to(h);
+                        }
+                        d.src.reset();
+                        d.gain = 0.0;
+                        d.gain_target = 1.0;
+                    }
+                }
+            }
+            Cmd::DiagStop { token } => {
+                if let Some(d) = self.diag.as_mut() {
+                    if d.token == token {
+                        d.gain_target = 0.0;
+                    }
+                }
+            }
+            Cmd::DiagParams { token, az, level, balance } => {
+                if let Some(d) = self.diag.as_mut() {
+                    if d.token == token {
+                        d.level = level.clamp(0.0, 1.5);
+                        d.balance = balance.clamp(-1.0, 1.0);
+                        if !d.direct && (az - d.az).abs() > 1e-6 {
+                            d.az = az;
+                            let h = self.hrir.hrir(az, 0.0);
+                            d.conv.set_hrir(h); // live move: crossfade is right
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -282,8 +447,15 @@ impl Mixer {
         let n = out.len() / 2;
         out.fill(0.0);
         let head = self.pose.read().head;
+        // While a diagnostic session holds (and isn't fading out),
+        // normal sources are frozen — they don't even tick, so file
+        // playheads and generator phases are exactly preserved.
+        let session_hold = self.diag.as_ref().map_or(false, |d| !d.exiting);
+        let normal_target = if session_hold { 0.0 } else { 1.0 };
+        let render_normal = !session_hold || self.norm_fade > 0.0;
 
-        for s in self.sources.iter_mut() {
+        if render_normal {
+            for s in self.sources.iter_mut() {
             // Finished one-shots and Remove'd sources fade through the
             // convolver tail instead of hard-cutting — then retire.
             if s.gen.is_finished() || s.removing {
@@ -352,6 +524,25 @@ impl Mixer {
                 out[2 * i] += l * gl;
                 out[2 * i + 1] += r * gr;
             }
+            }
+        }
+
+        // Session gate ramp on what the normals produced (runs before
+        // diag renders, so it never scales the test signal).
+        if self.norm_fade != normal_target {
+            let step = 1.0 / (self.sr * 0.02);
+            for i in 0..n {
+                out[2 * i] *= self.norm_fade;
+                out[2 * i + 1] *= self.norm_fade;
+                // Move toward the target and SNAP to it — a signum
+                // approach oscillates (signum(0.0) = +1.0 pushes the
+                // gate back up, so it never settles at silence).
+                self.norm_fade = if normal_target > self.norm_fade {
+                    (self.norm_fade + step).min(normal_target)
+                } else {
+                    (self.norm_fade - step).max(normal_target)
+                };
+            }
         }
 
         // Retire sources whose fade-out converged — off the RT thread
@@ -366,14 +557,65 @@ impl Mixer {
             }
         }
 
-        // Room tail on the mid signal.
-        let wet = self.wet;
+        // Room tail on the mid signal — suspended during a diagnostic
+        // session (tests are dry by definition; scene verb resumes on
+        // exit).
+        let wet = if session_hold { 0.0 } else { self.wet };
         if wet > 0.0 {
             for i in 0..n {
                 let mid = 0.5 * (out[2 * i] + out[2 * i + 1]);
                 out[2 * i] += self.verb_l.tick(mid) * wet;
                 out[2 * i + 1] += self.verb_r.tick(mid) * wet;
             }
+        }
+
+        // Diagnostic trial — rendered on top of the (faded) normal mix.
+        let mut retire_diag = false;
+        if let Some(d) = self.diag.as_mut() {
+            let done = d.src.is_finished();
+            if done && !d.exiting {
+                d.gain_target = 0.0; // trial finished — ring down
+            }
+            if d.gain > 1e-4 || d.gain_target > 0.0 {
+                let slew = 1.0 - (-1.0f32 / (self.sr * 0.02)).exp();
+                let (bl, br) = if d.direct {
+                    let b = d.balance;
+                    ((1.0 - b.max(0.0)), (1.0 + b.min(0.0)))
+                } else {
+                    (1.0, 1.0) // spatial mode: channel balance is neutral
+                };
+                for i in 0..n {
+                    d.gain += (d.gain_target - d.gain) * slew;
+                    let x = d.src.tick(self.sr) * d.gain * d.level;
+                    if d.direct {
+                        out[2 * i] += x * bl;
+                        out[2 * i + 1] += x * br;
+                    } else {
+                        let (l, r) = d.conv.tick(x);
+                        out[2 * i] += l;
+                        out[2 * i + 1] += r;
+                    }
+                }
+            } else {
+                // Silent: keep the generator ticking so its sample
+                // clock stays exact.
+                for _ in 0..n {
+                    d.src.tick(self.sr);
+                }
+            }
+            retire_diag = d.exiting && d.gain <= 1e-4;
+            let playing = d.gain_target > 0.0 && !d.exiting;
+            self.status.write(
+                d.token,
+                if playing { d.trial } else { 0 },
+                if playing { d.src.remaining_ms(self.sr) } else { 0 },
+            );
+        } else {
+            self.status.write(0, 0, 0);
+        }
+        if retire_diag {
+            let d = self.diag.take().unwrap();
+            self.trash_or_park(Trash::Diag(d));
         }
 
         // Master gain + soft clip.
@@ -390,10 +632,16 @@ impl Mixer {
 /// retired sources.
 pub fn standalone(
     sr: f32,
-) -> (Mixer, Arc<PoseSlot>, rtrb::Producer<Cmd>, rtrb::Consumer<SourceState>) {
+) -> (
+    Mixer,
+    Arc<PoseSlot>,
+    rtrb::Producer<Cmd>,
+    rtrb::Consumer<Trash>,
+    Arc<DiagStatus>,
+) {
     let slot = Arc::new(PoseSlot::new());
-    let (mix, tx, trash) = Mixer::new(sr, slot.clone());
-    (mix, slot, tx, trash)
+    let (mix, tx, trash, status) = Mixer::new(sr, slot.clone());
+    (mix, slot, tx, trash, status)
 }
 
 #[cfg(test)]
@@ -406,7 +654,7 @@ mod tests {
     /// Click at hard left must reach the left ear before the right ear.
     #[test]
     fn click_left_shows_itd_and_ild() {
-        let (mut mix, _slot, mut tx, _trash) = standalone(SAMPLE_RATE);
+        let (mut mix, _slot, mut tx, _trash, _status) = standalone(SAMPLE_RATE);
         // Measure the direct path only — the decorrelated room tail would
         // swamp a single click's ILD.
         tx.push(Cmd::SetWet { wet: 0.0 }).unwrap();
@@ -431,7 +679,7 @@ mod tests {
     fn head_turn_moves_image() {
         use crate::pose::Pose;
         use std::f32::consts::FRAC_PI_2;
-        let (mut mix, slot, mut tx, _trash) = standalone(SAMPLE_RATE);
+        let (mut mix, slot, mut tx, _trash, _status) = standalone(SAMPLE_RATE);
         tx.push(Cmd::add(
             1,
             source::make(SourceKind::Click),
@@ -456,7 +704,7 @@ mod tests {
     /// mute would click otherwise.
     #[test]
     fn gain_ramps_toward_target() {
-        let (mut mix, _slot, _tx, _trash) = standalone(SAMPLE_RATE);
+        let (mut mix, _slot, _tx, _trash, _status) = standalone(SAMPLE_RATE);
         mix.push_cmd(Cmd::add(
             1,
             source::make(SourceKind::Tone),
@@ -486,7 +734,7 @@ mod tests {
     /// add clicks at the convolution edge.
     #[test]
     fn add_fades_in() {
-        let (mut mix, _slot, _tx, _trash) = standalone(SAMPLE_RATE);
+        let (mut mix, _slot, _tx, _trash, _status) = standalone(SAMPLE_RATE);
         mix.push_cmd(Cmd::add(
             1,
             source::make(SourceKind::Tone),
@@ -508,7 +756,7 @@ mod tests {
     /// freed inside process().
     #[test]
     fn remove_fades_then_retires() {
-        let (mut mix, _slot, _tx, mut trash) = standalone(SAMPLE_RATE);
+        let (mut mix, _slot, _tx, mut trash, _status) = standalone(SAMPLE_RATE);
         mix.push_cmd(Cmd::add(
             1,
             source::make(SourceKind::Tone),
@@ -533,7 +781,7 @@ mod tests {
     /// silent source leaking forever.
     #[test]
     fn finished_source_retires() {
-        let (mut mix, _slot, _tx, mut trash) = standalone(SAMPLE_RATE);
+        let (mut mix, _slot, _tx, mut trash, _status) = standalone(SAMPLE_RATE);
         mix.push_cmd(Cmd::add(
             1,
             Box::new(crate::source::FileSource::new(
@@ -583,7 +831,7 @@ mod tests {
     /// under the counting allocator — zero allocations allowed.
     #[test]
     fn process_is_alloc_free() {
-        let (mut mix, _slot, mut tx, _trash) = standalone(SAMPLE_RATE);
+        let (mut mix, _slot, mut tx, _trash, _status) = standalone(SAMPLE_RATE);
         // Park a full trash ring + pending queue so retirement paths run.
         for i in 0..MAX_SOURCES as u32 {
             tx.push(Cmd::add(
@@ -622,7 +870,7 @@ mod tests {
     #[test]
     fn width_controls_lr_separation() {
         fn lr_ratio(width: f32) -> f32 {
-            let (mut mix, _slot, mut tx, _trash) = standalone(SAMPLE_RATE);
+            let (mut mix, _slot, mut tx, _trash, _status) = standalone(SAMPLE_RATE);
             tx.push(Cmd::SetWet { wet: 0.0 }).unwrap();
             tx.push(Cmd::SetWidth { w: width }).unwrap();
             tx.push(Cmd::add(
@@ -646,6 +894,164 @@ mod tests {
             wide > narrow * 1.5,
             "width 2.0 should deepen separation vs 0.6: {narrow} -> {wide}"
         );
+    }
+
+    // ── Diagnostic session ─────────────────────────────────────────
+
+    /// Left-only direct test: after the entry fade the right channel
+    /// carries exactly zero — this is what "Test left ear" must mean.
+    /// A normal source in the mix proves isolation holds with a scene
+    /// running.
+    #[test]
+    fn diag_direct_left_is_true_left_only() {
+        let (mut mix, _slot, mut tx, _trash, _status) = standalone(SAMPLE_RATE);
+        tx.push(Cmd::SetWet { wet: 0.0 }).unwrap();
+        tx.push(Cmd::add(
+            1,
+            source::make(SourceKind::Noise),
+            Vec3::new(0.0, 1.0, 0.0),
+            0.9,
+            SAMPLE_RATE,
+        ))
+        .unwrap();
+        let mut buf = [0f32; 19200]; // ~400ms: scene audible + entry fade
+        mix.process(&mut buf);
+        tx.push(Cmd::diag_enter(7, SAMPLE_RATE)).unwrap();
+        tx.push(Cmd::DiagPlay {
+            token: 7,
+            trial: 1,
+            direct: true,
+            az: 0.0,
+            level: 1.0,
+            balance: -1.0, // full left
+        })
+        .unwrap();
+        let mut buf = [0f32; 9600]; // 200ms — well past the 20ms gate ramp
+        mix.process(&mut buf);
+        // Measure past the entry fade (the scene's far-ear component
+        // legitimately occupies the first ~960 frames while it fades).
+        let tail = &buf[4000..];
+        let l: f32 = tail.iter().step_by(2).map(|x| x * x).sum();
+        let r: f32 = tail.iter().skip(1).step_by(2).map(|x| x * x).sum();
+        assert_eq!(r, 0.0, "left-only test leaked into the right channel");
+        assert!(l > 0.0, "left ear must carry the test signal");
+    }
+
+    /// Session freeze: a normal file source must not advance while the
+    /// diagnostic holds — its audible output resumes unchanged after
+    /// exit. Also proves scene audio is silent during the test.
+    #[test]
+    fn diag_freezes_normal_sources() {
+        let (mut mix, _slot, mut tx, _trash, _status) = standalone(SAMPLE_RATE);
+        tx.push(Cmd::add(
+            1,
+            source::make(SourceKind::Noise),
+            Vec3::new(1.0, 0.0, 0.0),
+            1.0,
+            SAMPLE_RATE,
+        ))
+        .unwrap();
+        let mut buf = [0f32; 19200];
+        mix.process(&mut buf); // let it get loud
+        tx.push(Cmd::diag_enter(3, SAMPLE_RATE)).unwrap();
+        // No trial playing — the entry fade alone must silence the scene.
+        let mut buf = [0f32; 9600];
+        mix.process(&mut buf);
+        let tail_energy: f32 =
+            buf[6000..].iter().map(|x| x * x).sum::<f32>();
+        assert_eq!(
+            tail_energy, 0.0,
+            "scene still audible after diagnostic entry fade"
+        );
+        tx.push(Cmd::DiagExit { token: 3 }).unwrap();
+        let mut buf = [0f32; 9600];
+        mix.process(&mut buf);
+        let resumed: f32 =
+            buf[6000..].iter().map(|x| x * x).sum::<f32>();
+        assert!(resumed > 0.0, "scene did not resume after diag exit");
+    }
+
+    /// A mismatched token can't control the session — stale sheets
+    /// can't resurrect a dismissed test.
+    #[test]
+    fn diag_token_scopes_commands() {
+        let (mut mix, _slot, mut tx, _trash, status) = standalone(SAMPLE_RATE);
+        tx.push(Cmd::diag_enter(5, SAMPLE_RATE)).unwrap();
+        tx.push(Cmd::DiagPlay {
+            token: 999, // wrong session
+            trial: 1,
+            direct: true,
+            az: 0.0,
+            level: 1.0,
+            balance: -1.0,
+        })
+        .unwrap();
+        let mut buf = [0f32; 9600];
+        mix.process(&mut buf);
+        let energy: f32 = buf.iter().map(|x| x * x).sum();
+        assert_eq!(energy, 0.0, "wrong-token trial produced audio");
+        assert_eq!(status.read().1, 0);
+        // Right token plays.
+        tx.push(Cmd::DiagPlay {
+            token: 5,
+            trial: 2,
+            direct: true,
+            az: 0.0,
+            level: 1.0,
+            balance: -1.0,
+        })
+        .unwrap();
+        let mut buf = [0f32; 9600];
+        mix.process(&mut buf);
+        let energy: f32 = buf.iter().map(|x| x * x).sum();
+        assert!(energy > 0.0, "valid trial produced no audio");
+    }
+
+    /// Spatial mode goes through the HRTF path — a left trial must
+    /// favor the left ear, like any scene source.
+    #[test]
+    fn diag_spatial_lateralizes() {
+        let (mut mix, _slot, mut tx, _trash, _status) = standalone(SAMPLE_RATE);
+        tx.push(Cmd::diag_enter(9, SAMPLE_RATE)).unwrap();
+        tx.push(Cmd::DiagPlay {
+            token: 9,
+            trial: 1,
+            direct: false,
+            az: std::f32::consts::FRAC_PI_2, // +90 = left
+            level: 1.0,
+            balance: 0.0,
+        })
+        .unwrap();
+        let mut buf = [0f32; 9600];
+        mix.process(&mut buf);
+        let l: f32 = buf.iter().step_by(2).map(|x| x * x).sum();
+        let r: f32 = buf.iter().skip(1).step_by(2).map(|x| x * x).sum();
+        assert!(l > r * 1.2, "spatial left trial should favor left ear: {l} vs {r}");
+    }
+
+    /// The chime is finite and the status reports its countdown —
+    /// the UI must never see a stuck "playing".
+    #[test]
+    fn diag_trial_finishes_and_reports() {
+        let (mut mix, _slot, mut tx, _trash, status) = standalone(SAMPLE_RATE);
+        tx.push(Cmd::diag_enter(11, SAMPLE_RATE)).unwrap();
+        tx.push(Cmd::DiagPlay {
+            token: 11,
+            trial: 4,
+            direct: true,
+            az: 0.0,
+            level: 1.0,
+            balance: 0.0,
+        })
+        .unwrap();
+        let mut buf = [0f32; 480];
+        mix.process(&mut buf);
+        assert_eq!(status.read().1, 4, "trial not reported as playing");
+        let mut buf = [0f32; 150_000]; // 75k frames ≈ 1.56 s — chime must end
+        mix.process(&mut buf);
+        let (_s, trial, rem) = status.read();
+        assert_eq!(trial, 0, "finished trial still reported playing");
+        assert_eq!(rem, 0);
     }
 
     fn peak_positions(buf: &[f32]) -> (usize, usize) {

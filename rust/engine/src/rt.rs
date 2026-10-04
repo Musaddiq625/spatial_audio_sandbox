@@ -2,7 +2,7 @@
 //! shared pose slot. Platform IO lives in cpal_io / oboe_io.
 
 use crate::math::Vec3;
-use crate::mix::{Cmd, SourceState};
+use crate::mix::{Cmd, DiagStatus, Trash};
 use crate::pose::PoseSlot;
 use crate::source::{self, Source, SourceKind};
 use std::sync::Arc;
@@ -26,9 +26,11 @@ pub struct EngineInfo {
 pub struct Engine {
     pub info: EngineInfo,
     cmd_tx: rtrb::Producer<Cmd>,
-    /// Retired sources land here — dropping them (decoded PCM, convolver
-    /// state) happens on the control thread, never in the callback.
-    trash_rx: rtrb::Consumer<SourceState>,
+    /// Retired state lands here — dropping it (decoded PCM, convolver
+    /// buffers) happens on the control thread, never in the callback.
+    trash_rx: rtrb::Consumer<Trash>,
+    /// Diagnostic-session status snapshot written by the mixer.
+    diag_status: Arc<DiagStatus>,
     pub pose: Arc<PoseSlot>,
     _stream: Box<dyn StreamGuard>,
 }
@@ -58,11 +60,12 @@ impl Engine {
     pub(crate) fn assemble(
         info: EngineInfo,
         cmd_tx: rtrb::Producer<Cmd>,
-        trash_rx: rtrb::Consumer<SourceState>,
+        trash_rx: rtrb::Consumer<Trash>,
+        diag_status: Arc<DiagStatus>,
         pose: Arc<PoseSlot>,
         stream: Box<dyn StreamGuard>,
     ) -> Engine {
-        Engine { info, cmd_tx, trash_rx, pose, _stream: stream }
+        Engine { info, cmd_tx, trash_rx, diag_status, pose, _stream: stream }
     }
 
     /// Drop retired sources on this (control) thread. Called at the top
@@ -133,5 +136,46 @@ impl Engine {
     /// exaggeration, reverb wet send, extra far-ear cut span (dB).
     pub fn set_spatial_params(&mut self, width: f32, wet: f32, ild_db: f32) {
         let _ = self.push(Cmd::SetSpatial { width, wet, ild_db });
+    }
+
+    // ── Diagnostic session (ear calibration / sound check) ─────────
+
+    /// Enter a diagnostic session — suspends normal rendering.
+    pub fn diag_enter(&mut self, token: u32) -> Result<(), String> {
+        self.push(Cmd::diag_enter(token, self.info.sample_rate as f32))
+    }
+
+    /// End the session — normal sources fade back in.
+    pub fn diag_exit(&mut self, token: u32) {
+        let _ = self.push(Cmd::DiagExit { token });
+    }
+
+    /// Start/replace a bounded trial. `az` in radians (+ = left);
+    /// `level` 0..1.5; `balance` -1 left .. +1 right (direct mode).
+    pub fn diag_play(
+        &mut self,
+        token: u32,
+        trial: u32,
+        direct: bool,
+        az: f32,
+        level: f32,
+        balance: f32,
+    ) -> Result<(), String> {
+        self.push(Cmd::DiagPlay { token, trial, direct, az, level, balance })
+    }
+
+    /// Stop the current trial; the session stays open.
+    pub fn diag_stop(&mut self, token: u32) {
+        let _ = self.push(Cmd::DiagStop { token });
+    }
+
+    /// Live-tune volume/balance/position mid-trial.
+    pub fn diag_params(&mut self, token: u32, az: f32, level: f32, balance: f32) {
+        let _ = self.push(Cmd::DiagParams { token, az, level, balance });
+    }
+
+    /// (session token, playing trial, remaining ms) — UI polls this.
+    pub fn diag_status(&self) -> (u32, u32, u32) {
+        self.diag_status.read()
     }
 }

@@ -8,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:spatial_audio_sandbox/src/director/llm_client.dart';
 import 'package:spatial_audio_sandbox/src/director/scene_director.dart';
 import 'package:spatial_audio_sandbox/src/director/sfx_client.dart';
+import 'package:spatial_audio_sandbox/src/key_constants.dart';
 import 'package:spatial_audio_sandbox/src/link/acoustic_bridge.dart';
 import 'package:spatial_audio_sandbox/src/listener/beacon_tracker.dart';
 import 'package:spatial_audio_sandbox/src/listener/calibration_sheet.dart';
@@ -184,8 +185,8 @@ class _SandboxPageState extends State<SandboxPage> {
   bool _yawOnly = false; // head tracking mode: false = full 3D
   // Spatial tuning — must match the Rust mixer defaults.
   double _width = 1.3; // L/R separation exaggeration
-  double _wet = 0.08; // reverb send
-  double _ildDb = 10.0; // extra far-ear cut span at full lateral
+  final double _wet = 0.08; // reverb send
+  final double _ildDb = 10.0; // extra far-ear cut span at full lateral
 
   void _sendSpatial() {
     if (_engineOn) {
@@ -1265,6 +1266,31 @@ class _SandboxPageState extends State<SandboxPage> {
     setState(() {});
   }
 
+  /// Sound check lifecycle: the scene clock + motion freeze for the
+  /// duration of the sheet (engine-side, the diagnostic session also
+  /// gates normal output to silence). A scene that was paused stays
+  /// paused; a playing one resumes at the same score position — the
+  /// DSP freeze preserved every playhead, so no reseek is needed.
+  Future<void> _openSoundCheck() async {
+    final wasPaused = _pausedT != null;
+    if (!wasPaused) _pauseScene();
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      builder: (_) => CalibrationSheet(
+        audio: EngineTestAudio(),
+        engineOn: _engineOn,
+        onStartEngine: () async {
+          await _startEngine();
+          return _engineOn;
+        },
+      ),
+    );
+    // Only resume what WE paused — a scene paused before the sheet
+    // stays paused.
+    if (!wasPaused && _pausedT != null && mounted) _resumeScene();
+  }
+
   void _removeSource(SourceDot s) {
     final id = s.id;
     if (id != null) removeSource(id: id);
@@ -1317,25 +1343,9 @@ class _SandboxPageState extends State<SandboxPage> {
         ),
         actions: [
           IconButton(
-            tooltip: 'ear calibration (L/R test)',
-            onPressed: () => showModalBottomSheet(
-              context: context,
-              isScrollControlled: true,
-              builder: (_) => CalibrationSheet(
-                pose: _pose,
-                engineOn: _engineOn,
-                width: _width,
-                wet: _wet,
-                ildDb: _ildDb,
-                onSpatial: (w, wt, ild) => setState(() {
-                  _width = w;
-                  _wet = wt;
-                  _ildDb = ild;
-                  _sendSpatial();
-                }),
-                onStartEngine: _startEngine,
-              ),
-            ),
+            tooltip: 'sound check (L/R test)',
+            key: KeyConstants.soundCheckButton,
+            onPressed: _openSoundCheck,
             icon: const Icon(Icons.hearing, size: 20),
           ),
           IconButton(

@@ -247,6 +247,102 @@ pub fn set_yaw_only(yaw_only: bool) {
     }
 }
 
+// ── Diagnostic session (sound check / ear calibration) ─────────────
+// Session commands are token-scoped: a stale sheet can't resurrect a
+// dismissed test. `direct` = raw channel output (headphone check);
+// `!direct` = the same HRTF path scene sources use.
+
+/// Enter a diagnostic session. Fades the scene out and freezes every
+/// normal source (playheads preserved for the exit).
+#[flutter_rust_bridge::frb(sync)]
+pub fn diag_enter(token: u32) -> Result<()> {
+    let mut st = state().lock().map_err(|_| anyhow!("state poisoned"))?;
+    st.engine
+        .as_mut()
+        .ok_or_else(|| anyhow!("engine not running"))?
+        .diag_enter(token)
+        .map_err(|e| anyhow!(e))
+}
+
+/// End the session — normal sources fade back in. Idempotent.
+#[flutter_rust_bridge::frb(sync)]
+pub fn diag_exit(token: u32) {
+    if let Ok(mut st) = state().lock() {
+        if let Some(e) = st.engine.as_mut() {
+            e.diag_exit(token);
+        }
+    }
+}
+
+/// Start or replace a bounded trial (~1.15 s chime pair). `az` radians,
+/// + = left (spatial mode); `level` 0..1.5; `balance` -1..1 (direct).
+#[flutter_rust_bridge::frb(sync)]
+pub fn diag_play(
+    token: u32,
+    trial: u32,
+    direct: bool,
+    az: f32,
+    level: f32,
+    balance: f32,
+) -> Result<()> {
+    if !(az.is_finite() && az.abs() <= std::f32::consts::PI + 0.1) {
+        return Err(anyhow!("az out of range"));
+    }
+    if !(level.is_finite() && (0.0..=1.5).contains(&level)) {
+        return Err(anyhow!("level out of range"));
+    }
+    if !(balance.is_finite() && balance.abs() <= 1.0) {
+        return Err(anyhow!("balance out of range"));
+    }
+    let mut st = state().lock().map_err(|_| anyhow!("state poisoned"))?;
+    st.engine
+        .as_mut()
+        .ok_or_else(|| anyhow!("engine not running"))?
+        .diag_play(token, trial, direct, az, level, balance)
+        .map_err(|e| anyhow!(e))
+}
+
+/// Stop the current trial; the session stays open. Idempotent.
+#[flutter_rust_bridge::frb(sync)]
+pub fn diag_stop(token: u32) {
+    if let Ok(mut st) = state().lock() {
+        if let Some(e) = st.engine.as_mut() {
+            e.diag_stop(token);
+        }
+    }
+}
+
+/// Live-tune volume/balance/position mid-trial.
+#[flutter_rust_bridge::frb(sync)]
+pub fn diag_params(token: u32, az: f32, level: f32, balance: f32) {
+    if let Ok(mut st) = state().lock() {
+        if let Some(e) = st.engine.as_mut() {
+            e.diag_params(token, az, level, balance);
+        }
+    }
+}
+
+/// Diagnostic status snapshot for the UI.
+pub struct DiagStatusWire {
+    /// Session token while a session is open, else 0.
+    pub session: u32,
+    /// Currently sounding trial id, else 0.
+    pub trial: u32,
+    /// Ms left in the current trial, else 0.
+    pub remaining_ms: u32,
+}
+
+/// Poll at UI cadence — never per-frame.
+#[flutter_rust_bridge::frb(sync)]
+pub fn diag_status() -> DiagStatusWire {
+    let (session, trial, remaining_ms) = state()
+        .lock()
+        .ok()
+        .and_then(|mut st| st.engine.as_mut().map(|e| e.diag_status()))
+        .unwrap_or((0, 0, 0));
+    DiagStatusWire { session, trial, remaining_ms }
+}
+
 pub fn add_source(kind: SourceKindWire, x: f32, y: f32, z: f32, gain: f32) -> Result<u32> {
     let mut st = state().lock().map_err(|_| anyhow!("state poisoned"))?;
     let id = st.next_id;

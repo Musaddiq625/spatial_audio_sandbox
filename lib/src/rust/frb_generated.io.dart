@@ -35,6 +35,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
   double dco_decode_box_autoadd_f_64(dynamic raw);
 
   @protected
+  DiagStatusWire dco_decode_diag_status_wire(dynamic raw);
+
+  @protected
   EngineInfoWire dco_decode_engine_info_wire(dynamic raw);
 
   @protected
@@ -89,6 +92,9 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   double sse_decode_box_autoadd_f_64(SseDeserializer deserializer);
+
+  @protected
+  DiagStatusWire sse_decode_diag_status_wire(SseDeserializer deserializer);
 
   @protected
   EngineInfoWire sse_decode_engine_info_wire(SseDeserializer deserializer);
@@ -151,6 +157,12 @@ abstract class RustLibApiImplPlatform extends BaseApiImpl<RustLibWire> {
 
   @protected
   void sse_encode_box_autoadd_f_64(double self, SseSerializer serializer);
+
+  @protected
+  void sse_encode_diag_status_wire(
+    DiagStatusWire self,
+    SseSerializer serializer,
+  );
 
   @protected
   void sse_encode_engine_info_wire(
