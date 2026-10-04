@@ -80,6 +80,29 @@ class SceneCompiler {
     (RegExp(r'fly(?:ing|ies|s)? (?:past|by)|flies? (?:past|by)|passes? (?:by|past)|go(?:es)? (?:past|by)|swoops? (?:past|by)|crosses?\b|sweep'), 'pass'),
   ];
 
+  /// Distance words — checked in the same source-scoped context as
+  /// spatial words (the piece that names the source).
+  static final _distWords = [
+    (RegExp(
+        r'right next to|right beside|next to me|at my feet|in my hands|'
+        r'arm.s reach|\bclose\b|\bclosing in\b'),
+        'close'),
+    (RegExp(r'\bfar\b|distant|across|in the distance|far away|miles away'),
+        'far'),
+    (RegExp(r'\bnearby\b|a few steps|couple of steps'), 'near'),
+  ];
+
+  /// Setting words — the environment the prompt states, used when the
+  /// model omits the screenplay's environment field.
+  static const _envWords = [
+    'cave', 'cavern', 'tunnel', 'forest', 'woods', 'jungle', 'beach',
+    'ocean', 'sea', 'harbor', 'port', 'city', 'street', 'market',
+    'mountain', 'peak', 'desert', 'dune', 'room', 'house', 'hall',
+    'cabin', 'ship', 'boat', 'train', 'plane', 'park', 'field',
+    'meadow', 'lake', 'river', 'island', 'swamp', 'garage', 'basement',
+    'attic', 'church', 'stadium', 'barn', 'farm',
+  ];
+
   /// End-of-life verbs — the source stops sounding at that scene time.
   static final _endPattern = RegExp(
     r'(go(?:es)? out|dies? down|dies?|stops?|fades? (?:away|out)|'
@@ -203,13 +226,11 @@ class SceneCompiler {
       sp.environment = env.trim();
     }
     final seenNames = <String>{};
+    final seenSources = <String>{};
     for (final (i, e) in list.indexed) {
       if (e is! Map) throw SpecException('source $i is not an object');
       var name = (e['name'] as String?)?.trim() ?? '';
       if (name.isEmpty) name = 'source$i';
-      while (!seenNames.add(name)) {
-        name = '${name}_'; // dedupe
-      }
       final s = ScreenplaySource()
         ..name = name
         ..sound = ((e['sound'] as String?) ?? '').trim()
@@ -222,6 +243,16 @@ class SceneCompiler {
         ..ends = _pick(e['ends'], endings, 'never')
         ..endS = _num(e['end_s'], 0)
         ..loop = e['loop'] is bool ? e['loop'] as bool : true;
+      // The model sometimes emits the same source twice — an exact copy
+      // is dropped, only a genuinely different source sharing the name
+      // gets renamed (fire → fire_).
+      final fp =
+          '$name|${s.sound}|${s.role}|${s.place}|${s.distance}|${s.movement}';
+      if (!seenSources.add(fp)) continue;
+      while (!seenNames.add(name)) {
+        name = '${name}_'; // dedupe
+      }
+      s.name = name;
       sp.sources.add(s);
     }
     return sp;
@@ -399,12 +430,30 @@ class SceneCompiler {
     return best;
   }
 
-  /// Spatial text for a fragment: its own comma-fragment, extended one
-  /// fragment back when it carries no spatial word — "behind me, some
-  /// kids are playing" keeps "behind" attached to the kids.
-  static String _spatialCtx(_Frag? frag, List<_Frag> frags) {
+  /// Spatial text for a fragment: its own comma-fragment, narrowed to
+  /// the description piece that names the source — "waves at my feet
+  /// while a loon calls to my left" gives the loon 'left', not the
+  /// waves. Extended one fragment back when the piece carries no
+  /// spatial word — "behind me, some kids are playing" keeps "behind"
+  /// attached to the kids.
+  static String _spatialCtx(
+      _Frag? frag, List<_Frag> frags, ScreenplaySource s) {
     if (frag == null) return '';
     var ctx = frag.text;
+    final pieces =
+        ctx.split(RegExp(r'\b(?:and|while|whilst|but|with)\b'));
+    if (pieces.length > 1) {
+      final toks = _sourceTokens(s);
+      var best = -1, hits = 0;
+      for (var i = 0; i < pieces.length; i++) {
+        final h = toks.where((t) => _wordIn(t, pieces[i])).length;
+        if (h > hits) {
+          hits = h;
+          best = i;
+        }
+      }
+      if (best >= 0 && hits > 0) ctx = pieces[best];
+    }
     if (!_spatialWords.any((w) => w.$1.hasMatch(ctx))) {
       final idx = frags.indexOf(frag);
       if (idx > 0 && frags[idx - 1].clauseIdx == frag.clauseIdx) {
@@ -444,8 +493,13 @@ class SceneCompiler {
   }) {
     final clsRec = _splitClauses(prompt);
     final cls = clsRec.map((c) => c.text).toList();
+    final promptL = prompt.toLowerCase();
     final spec = SceneSpec(<SpecSource>[])
-      ..environment = sp.environment;
+      // The model omits "environment" on most prompts — the prompt
+      // itself usually states the setting, so recover it before
+      // deciding the SFX text has no acoustic context.
+      ..environment = sp.environment ??
+          _envWords.where((w) => _wordIn(w, promptL)).firstOrNull;
     final out = <SpecSource>[];
 
     // Timing words (or an end-event) make this a timed scene. Without
@@ -512,7 +566,7 @@ class SceneCompiler {
       final compiled = _compileSource(
         s,
         clause,
-        _spatialCtx(frag, frags),
+        _spatialCtx(frag, frags, s),
         timed ? (frag?.time ?? 0) : 0,
         timed: timed,
         marked: frag?.marker ?? false,
@@ -619,7 +673,16 @@ class SceneCompiler {
     final el = place == 'above' ? 60.0 : 0.0;
     final isBed = s.role == 'ambience' || s.role == 'weather' ||
         place == 'around';
-    var dist = _distM[s.distance] ?? 1.8;
+    // Distance words in the source's piece override the model's guess —
+    // "pigeons close in front" is close even if the model said far.
+    var distance = s.distance;
+    for (final (re, d) in _distWords) {
+      if (re.hasMatch(spatialCtx)) {
+        distance = d;
+        break;
+      }
+    }
+    var dist = _distM[distance] ?? 1.8;
     if (isBed && dist < 2) dist = 2.5;
 
     // Movement: only a verb whose subject is THIS source can move it —
@@ -645,16 +708,24 @@ class SceneCompiler {
 
     // Timing: 'beginning' means 0 unless the source's fragment itself
     // carries a sequencing marker (the model mislabeled a "then X"
-    // source); 'later' uses the fragment's staggered time.
+    // source); 'later' uses the fragment's staggered time; a missing
+    // start_s falls back to the fragment's time instead of 0 — the
+    // model said "after_seconds" without writing the number.
     final delay = !timed
         ? 0.0
         : switch (s.start) {
-            'after_seconds' => s.startS.clamp(0, 120),
+            'after_seconds' => s.startS > 0
+                ? s.startS.clamp(0, 120).toDouble()
+                : (fragTime > 0 ? fragTime : 4.0),
             'later' => fragTime > 0 ? fragTime : 4.0,
             _ => marked ? fragTime : 0.0,
           };
+    // 'event' is a role label, not a lifecycle — the model called a
+    // crackling fire an event while also saying loop:true ends:never.
+    // One-shot only when the lifecycle agrees.
     final isEvent = s.role == 'event';
-    final loop = isEvent ? false : s.loop;
+    final loop =
+        isEvent && (!s.loop || s.ends != 'never') ? false : s.loop;
 
     final src = SpecSource(
       name: s.name,

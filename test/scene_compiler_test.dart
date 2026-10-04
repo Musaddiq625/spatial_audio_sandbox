@@ -246,6 +246,78 @@ void main() {
     expect(rt.sources.single.wander, isNotNull);
     expect(rt.sources.single.wander!.anchorAzDeg, 180);
   });
+
+  // --- Regressions found by live eval against the real endpoint ---
+
+  test('exact duplicate emission is dropped, not renamed', () {
+    // The real model emitted "fire" twice, verbatim — a copy is not a
+    // second source.
+    final spec = compile('a campfire in front of me', '{"sources":['
+        '{"name":"fire","sound":"campfire crackling","role":"object",'
+        '"place":"front","distance":"near","movement":"still",'
+        '"start":"beginning","ends":"never","loop":true},'
+        '{"name":"fire","sound":"campfire crackling","role":"object",'
+        '"place":"front","distance":"near","movement":"still",'
+        '"start":"beginning","ends":"never","loop":true}]}');
+    expect(spec.sources.where((s) => s.name.startsWith('fire')),
+        hasLength(1));
+  });
+
+  test('after_seconds without start_s falls back to fragment time', () {
+    // Real model output: start:"after_seconds" with no start_s — the
+    // "after a while" fragment's staggered time must win, not 0.
+    const prompt = 'I sit by a fire. After a while, a cold breeze comes';
+    final spec = compile(prompt, '{"sources":['
+        '{"name":"fire","sound":"crackling fire","role":"object",'
+        '"place":"front","distance":"near","movement":"still",'
+        '"start":"beginning","ends":"never","loop":true},'
+        '{"name":"cold breeze","sound":"wind blowing","role":"weather",'
+        '"place":"around","distance":"far","movement":"still",'
+        '"start":"after_seconds","ends":"never","loop":true}]}');
+    expect(byName(spec, 'cold breeze')!.delayS, greaterThan(0));
+    expect(byName(spec, 'fire')!.delayS, 0);
+  });
+
+  test('distance words in the piece override the model', () {
+    // Real model output: "pigeons close in front" got distance:"far".
+    const prompt =
+        'a busy city street, pigeons close in front of me';
+    final spec = compile(prompt, '{"sources":['
+        '{"name":"pigeons","sound":"pigeons cooing","role":"creature",'
+        '"place":"around","distance":"far","movement":"still",'
+        '"start":"beginning","ends":"never","loop":true}]}');
+    final p = byName(spec, 'pigeons')!;
+    expect(p.azDeg, 0);
+    expect(p.distM, lessThan(1.0)); // "close" — not the model's 6m
+  });
+
+  test('spatial words stay on their own side of "while"', () {
+    // Real model output: the loon's "to my left" bled onto the waves
+    // when the whole clause was one spatial context.
+    const prompt =
+        'waves lapping at my feet while a loon calls far to my left';
+    final spec = compile(prompt, '{"sources":['
+        '{"name":"waves","sound":"ocean waves lapping","role":"weather",'
+        '"place":"around","distance":"far","movement":"still",'
+        '"start":"beginning","ends":"never","loop":true},'
+        '{"name":"loon","sound":"loon call","role":"creature",'
+        '"place":"above","distance":"far","movement":"still",'
+        '"start":"beginning","ends":"never","loop":false}]}');
+    expect(byName(spec, 'loon')!.azDeg, 90); // "to my left"
+    // Waves keep the model's "around" — "to my left" isn't theirs.
+    expect(byName(spec, 'waves')!.azDeg, isNot(90));
+  });
+
+  test('event role cannot kill a looping bed', () {
+    // Real model labeled the fire role:"event" but loop:true + ends:
+    // never — the lifecycle fields agree it is continuous.
+    const prompt = 'a campfire burning in front of me';
+    final spec = compile(prompt, '{"sources":['
+        '{"name":"fire","sound":"campfire crackling","role":"event",'
+        '"place":"front","distance":"close","movement":"still",'
+        '"start":"beginning","ends":"never","loop":true}]}');
+    expect(byName(spec, 'fire')!.loop, isTrue);
+  });
 }
 
 bool _conceptsHit(SpecSource s, String word) =>
