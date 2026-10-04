@@ -731,7 +731,9 @@ class _SandboxPageState extends State<SandboxPage> {
   /// Non-null = the scene is paused at this score position. Freezing
   /// the clock stops cues, endings, and the wrap check for free.
   double? _pausedT;
-  bool _repeat = true;
+  /// Scenes always loop — the repeat toggle was removed from the demo
+  /// surface; keep the wrap logic so a finished composition replays.
+  final bool _repeat = true;
   _PromptEntry? _selectedPrompt;
 
   double get _sceneT {
@@ -1056,19 +1058,6 @@ class _SandboxPageState extends State<SandboxPage> {
           ),
           Row(
             children: [
-              IconButton(
-                padding: EdgeInsets.zero,
-                onPressed: () => setState(() => _repeat = !_repeat),
-                icon: Icon(
-                  _repeat ? Icons.repeat_on : Icons.repeat,
-                  size: 16,
-                ),
-                color: _repeat
-                    ? Theme.of(context).colorScheme.primary
-                    : const Color(0xFF9AA4B2),
-                tooltip: _repeat ? 'scene repeats' : 'scene plays once',
-                visualDensity: VisualDensity.compact,
-              ),
               const Spacer(),
               Text(
                 '${t.toStringAsFixed(1)} / ${len.toStringAsFixed(1)}s',
@@ -1461,20 +1450,6 @@ class _SandboxPageState extends State<SandboxPage> {
           // scene's score + chips scroll instead of overflowing.
           Flexible(
             child: SingleChildScrollView(child: _controls()),
-          ),
-          const Padding(
-            padding: EdgeInsets.only(top: 2, bottom: 3),
-            child: Center(
-              child: Text(
-                'Built with ❤️\nby Musaddiq625',
-                textAlign: TextAlign.center,
-                style: TextStyle(
-                  fontSize: 10,
-                  color: Color(0xFF5A6470),
-                  height: 1.3,
-                ),
-              ),
-            ),
           ),
         ],
       ),
@@ -1919,20 +1894,6 @@ class _SandboxPageState extends State<SandboxPage> {
                         );
                       },
                     ),
-                    IconButton(
-                      onPressed: () =>
-                          setState(() => _repeat = !_repeat),
-                      icon: Icon(
-                        _repeat ? Icons.repeat_on : Icons.repeat,
-                        size: 18,
-                      ),
-                      color: _repeat
-                          ? Theme.of(context).colorScheme.primary
-                          : const Color(0xFF9AA4B2),
-                      tooltip:
-                          _repeat ? 'scene repeats' : 'scene plays once',
-                      visualDensity: VisualDensity.compact,
-                    ),
                     const SizedBox(width: 2),
                     Expanded(
                       child: Text(
@@ -1968,6 +1929,20 @@ class _SandboxPageState extends State<SandboxPage> {
           for (final s
               in _sources.where((d) => d.isFile && d.estDurS <= 0))
             _seekRow(s),
+          const Padding(
+            padding: EdgeInsets.only(top: 10, bottom: 2),
+            child: Center(
+              child: Text(
+                'Built with ❤️\nby Musaddiq625',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 10,
+                  color: Color(0xFF5A6470),
+                  height: 1.3,
+                ),
+              ),
+            ),
+          ),
         ],
       ),
     );
