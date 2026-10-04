@@ -381,16 +381,21 @@ class _SandboxPageState extends State<SandboxPage> {
 
   Future<void> _toggleEngine() async {
     if (_engineOn) {
-      await _stopEngine();
+      await _stopEngine(clearScene: true);
     } else {
       await _startEngine();
     }
   }
 
-  Future<void> _stopEngine() async {
+  /// [clearScene]: the UI stop button tears the scene down with the
+  /// engine. The network-offline path keeps sources — they get
+  /// re-added on reconnect.
+  Future<void> _stopEngine({bool clearScene = false}) async {
     _director.setMotionPaused(true); // freeze directed dots on the radar
     _scrubbing = false; // drop any in-flight scrub commit
     _scrubT = null;
+    _pausedT = null;
+    if (clearScene) _clearAll(); // remove pushes flush while engine lives
     await engineStop();
     // The engine dropped every source — ids are now stale.
     for (final b in _beacons.values) {
@@ -523,6 +528,9 @@ class _SandboxPageState extends State<SandboxPage> {
       endS: spec?.endS,
     );
     setState(() => _sources.add(dot));
+    // Let the radar paint the dot before its sound can start — the
+    // user watches sources appear, then hears them.
+    await _waitFrame();
     final delay = dot.delayS;
     if (delay <= 0) {
       // Immediate cue — add the engine source right away.
@@ -540,6 +548,14 @@ class _SandboxPageState extends State<SandboxPage> {
       _syncSeekTicker(); // start ticking so the pending add fires
     }
     return dot;
+  }
+
+  /// One rendered frame — used to sequence "dot on radar, then audio"
+  /// so a source's sound never precedes its marker.
+  Future<void> _waitFrame() {
+    final c = Completer<void>();
+    WidgetsBinding.instance.addPostFrameCallback((_) => c.complete());
+    return c.future;
   }
 
   /// Create the engine source for a dot that has none — procedural or
@@ -627,7 +643,15 @@ class _SandboxPageState extends State<SandboxPage> {
   final _clipStatus = <String, SfxStatus>{};
   _PromptEntry? _activePrompt; // entry that produced the live scene
 
+  /// Non-null = the scene is paused at this score position. Freezing
+  /// the clock stops cues, endings, and the wrap check for free.
+  double? _pausedT;
+  bool _repeat = true;
+  _PromptEntry? _selectedPrompt;
+
   double get _sceneT {
+    final paused = _pausedT;
+    if (paused != null) return paused;
     final t0 = _sceneT0;
     if (t0 == null) return 0;
     return DateTime.now().difference(t0).inMilliseconds / 1000;
@@ -655,6 +679,7 @@ class _SandboxPageState extends State<SandboxPage> {
     _clipStatus.clear();
     _scrubbing = false; // a stale drag must not commit onto the new scene
     _scrubT = null;
+    _pausedT = null; // a fresh scene is never born paused
   }
 
   void _syncSeekTicker() {
@@ -662,12 +687,19 @@ class _SandboxPageState extends State<SandboxPage> {
         _engineOn && _sources.any((s) => s.isFile || s.needsSource);
     if (active) {
       _seekTicker ??= Timer.periodic(const Duration(milliseconds: 250), (_) {
-        // No mid-drag work: wraps and pending adds would fight the
-        // preview and flood the 64-slot command queue.
-        if (!mounted || _scrubbing) return;
+        // No mid-drag or paused work: wraps and pending adds would
+        // fight the preview and flood the 64-slot command queue.
+        if (!mounted || _scrubbing || _pausedT != null) return;
         final len = _sceneLen;
-        if (len > 0 && _sceneT >= len) {
-          _sceneSeek(_sceneT % len); // scene wraps — composition repeats
+        if (len > 0 && _sceneT > len) {
+          if (_repeat) {
+            _sceneSeek(_sceneT % len); // scene wraps — composition repeats
+          } else {
+            // Repeat off: pin the clock at the end — the bar rests at
+            // len, beds keep sounding, one-shots don't refire.
+            _sceneT0 = DateTime.now()
+                .subtract(Duration(milliseconds: (len * 1000).round()));
+          }
         }
         _ensurePendingAdds();
         setState(() {});
@@ -791,12 +823,49 @@ class _SandboxPageState extends State<SandboxPage> {
     setState(() {});
   }
 
+  /// Scene pause — same mute/freeze shape as the scrub drag: live
+  /// sources gain→0 (the Rust ramp smooths it), motion freezes, and
+  /// _sceneT returns the frozen position so cues/endings can't fire.
+  void _pauseScene() {
+    if (_pausedT != null) return;
+    _scrubbing = false; // a scrub-in-flight must not commit over a pause
+    _scrubT = null;
+    _pausedT = _sceneT;
+    for (final dot in _sources) {
+      final id = dot.id;
+      if (id != null) setSourceGain(id: id, gain: 0);
+    }
+    _director.setMotionPaused(true);
+    setState(() {});
+  }
+
+  void _resumeScene() {
+    final t = _pausedT;
+    if (t == null) return;
+    _pausedT = null;
+    _sceneT0 = DateTime.now()
+        .subtract(Duration(milliseconds: (t * 1000).round()));
+    if (_engineOn) {
+      _director.seekScene(t); // motion anchors follow the score, not
+      // wall time — without this a paused orbit would jump ahead.
+      _director.setMotionPaused(false);
+      for (final dot in _sources) {
+        final id = dot.id;
+        if (id != null && !dot.ended) {
+          setSourceGain(id: id, gain: dot.gain);
+        }
+      }
+    }
+    setState(() {});
+  }
+
   /// Master-bar commit: re-anchor the scene clock, motion anchors, and
   /// every authored dot's engine source to the new scene time.
   void _sceneSeek(double t) {
     if (_sceneT0 == null) return;
     _sceneT0 = DateTime.now()
         .subtract(Duration(milliseconds: (t * 1000).round()));
+    if (_pausedT != null) _pausedT = t; // scrubbing while paused stays paused
     _director.seekScene(t);
     for (final dot in _sources) {
       if (dot.estDurS <= 0) continue; // manual sources aren't on the score
@@ -916,6 +985,23 @@ class _SandboxPageState extends State<SandboxPage> {
               '${t.toStringAsFixed(1)} / ${len.toStringAsFixed(1)}s',
               style: const TextStyle(fontSize: 10, color: Color(0xFF9AA4B2)),
               textAlign: TextAlign.right,
+            ),
+          ),
+          SizedBox(
+            width: 30,
+            height: 24,
+            child: IconButton(
+              padding: EdgeInsets.zero,
+              onPressed: () => setState(() => _repeat = !_repeat),
+              icon: Icon(
+                _repeat ? Icons.repeat_on : Icons.repeat,
+                size: 16,
+              ),
+              color: _repeat
+                  ? Theme.of(context).colorScheme.primary
+                  : const Color(0xFF9AA4B2),
+              tooltip: _repeat ? 'scene repeats' : 'scene plays once',
+              visualDensity: VisualDensity.compact,
             ),
           ),
         ],
@@ -1055,11 +1141,15 @@ class _SandboxPageState extends State<SandboxPage> {
       _describeStarted = DateTime.now();
       _llmChars = 0;
       _prompts.add(entry);
+      _selectedPrompt = entry; // the submitted prompt is selected
       // FIFO cap — drop oldest completed entries.
       while (_prompts.length > _historyCap) {
         _prompts.removeAt(0);
       }
     });
+    // Engine spins up in parallel with Gemma's ~40 s think — the scene
+    // lands ready to play instead of failing adds onto a dead engine.
+    if (!_engineOn) unawaited(_startEngine());
     _describeTicker?.cancel();
     _describeTicker = Timer.periodic(const Duration(milliseconds: 500), (_) {
       if (mounted) setState(() {});
@@ -1085,10 +1175,26 @@ class _SandboxPageState extends State<SandboxPage> {
     }
   }
 
-  Future<void> _replay(_PromptEntry e) async {
+  /// Play/pause for the selected history entry: pause an actively
+  /// playing scene, resume a paused one, or (re)apply the spec —
+  /// starting the engine itself when needed.
+  Future<void> _playEntry(_PromptEntry e) async {
+    final playing = _engineOn &&
+        _pausedT == null &&
+        _activePrompt == e &&
+        _sources.isNotEmpty;
+    if (playing) {
+      _pauseScene();
+      return;
+    }
+    if (_pausedT != null && _activePrompt == e) {
+      _resumeScene();
+      return;
+    }
     final spec = e.spec;
     if (spec == null) return;
     _activePrompt = e;
+    if (!_engineOn) await _startEngine();
     await _director.apply(spec);
   }
 
@@ -1106,6 +1212,7 @@ class _SandboxPageState extends State<SandboxPage> {
     _sources.clear();
     _director.reset();
     _sceneT0 = null;
+    _pausedT = null;
     _scrubbing = false;
     _scrubT = null;
     _syncSeekTicker();
@@ -1503,69 +1610,114 @@ class _SandboxPageState extends State<SandboxPage> {
                 ),
             ],
           ),
-          if (_prompts.isNotEmpty)
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
+          if (_prompts.isNotEmpty) ...[
+            const SizedBox(height: 4),
+            Row(
               children: [
-                for (final e in _prompts.reversed)
-                  Padding(
-                    padding: const EdgeInsets.only(top: 3),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        e.spec == null
-                            ? Chip(
-                                visualDensity: VisualDensity.compact,
-                                avatar: const SizedBox(
-                                  width: 12,
-                                  height: 12,
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 2,
-                                  ),
-                                ),
-                                label: Text(
-                                  _promptLabel(e.prompt),
-                                  style: const TextStyle(fontSize: 11),
-                                ),
-                              )
-                            : ActionChip(
-                                visualDensity: VisualDensity.compact,
-                                tooltip: e.prompt,
-                                avatar: const Icon(
-                                  Icons.auto_awesome,
-                                  size: 14,
-                                ),
-                                label: Text(
-                                  _promptLabel(e.prompt),
-                                  style: const TextStyle(fontSize: 11),
-                                ),
-                                onPressed: () => _replay(e),
-                              ),
-                        const SizedBox(width: 6),
-                        Text(
-                          e.spec == null
-                              ? 'Gemma… ${DateTime.now().difference(e.startedAt).inSeconds}s'
-                              : e == _activePrompt &&
-                                      _clipStatus.values.any(
-                                        (s) => s == SfxStatus.generating,
-                                      )
-                                  ? 'compiling audio '
-                                      '${_clipStatus.values.where((s) => s != SfxStatus.generating).length}'
-                                      '/${_clipStatus.length}…'
-                                  : e.specSeconds != null
-                                      ? 'spec in ${e.specSeconds!.toStringAsFixed(0)}s'
-                                          '${e == _activePrompt && _clipStatus.isNotEmpty ? ' · audio ready' : ''}'
-                                      : 'saved',
-                          style: const TextStyle(
-                            fontSize: 10,
-                            color: Color(0xFF9AA4B2),
+                Expanded(
+                  child: DropdownButtonFormField<_PromptEntry>(
+                    initialValue:
+                        _prompts.contains(_selectedPrompt) ? _selectedPrompt : null,
+                    isExpanded: true,
+                    decoration: const InputDecoration(
+                      isDense: true,
+                      border: OutlineInputBorder(),
+                      contentPadding:
+                          EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                    ),
+                    hint: const Text(
+                      'previous scenes',
+                      style: TextStyle(fontSize: 12),
+                    ),
+                    items: [
+                      for (final e in _prompts.reversed)
+                        DropdownMenuItem(
+                          value: e,
+                          child: Text(
+                            _promptLabel(e.prompt),
+                            style: const TextStyle(fontSize: 12),
+                            overflow: TextOverflow.ellipsis,
                           ),
                         ),
-                      ],
-                    ),
+                    ],
+                    onChanged: (e) =>
+                        setState(() => _selectedPrompt = e),
                   ),
+                ),
               ],
             ),
+            if (_selectedPrompt != null)
+              Padding(
+                padding: const EdgeInsets.only(top: 2),
+                child: Row(
+                  children: [
+                    Builder(
+                      builder: (context) {
+                        final e = _selectedPrompt!;
+                        final playing = _engineOn &&
+                            _pausedT == null &&
+                            _activePrompt == e &&
+                            _sources.isNotEmpty;
+                        final pausedHere =
+                            _pausedT != null && _activePrompt == e;
+                        return IconButton(
+                          onPressed: e.spec == null
+                              ? null
+                              : () => _playEntry(e),
+                          icon: Icon(
+                            playing ? Icons.pause : Icons.play_arrow,
+                            size: 20,
+                          ),
+                          tooltip: playing
+                              ? 'pause scene'
+                              : pausedHere
+                                  ? 'resume scene'
+                                  : 'play scene',
+                          visualDensity: VisualDensity.compact,
+                        );
+                      },
+                    ),
+                    IconButton(
+                      onPressed: () =>
+                          setState(() => _repeat = !_repeat),
+                      icon: Icon(
+                        _repeat ? Icons.repeat_on : Icons.repeat,
+                        size: 18,
+                      ),
+                      color: _repeat
+                          ? Theme.of(context).colorScheme.primary
+                          : const Color(0xFF9AA4B2),
+                      tooltip:
+                          _repeat ? 'scene repeats' : 'scene plays once',
+                      visualDensity: VisualDensity.compact,
+                    ),
+                    const SizedBox(width: 2),
+                    Expanded(
+                      child: Text(
+                        _selectedPrompt!.spec == null
+                            ? 'Gemma… ${DateTime.now().difference(_selectedPrompt!.startedAt).inSeconds}s'
+                            : _selectedPrompt == _activePrompt &&
+                                    _clipStatus.values.any(
+                                      (s) => s == SfxStatus.generating,
+                                    )
+                                ? 'compiling audio '
+                                    '${_clipStatus.values.where((s) => s != SfxStatus.generating).length}'
+                                    '/${_clipStatus.length}…'
+                                : _selectedPrompt!.specSeconds != null
+                                    ? 'spec in ${_selectedPrompt!.specSeconds!.toStringAsFixed(0)}s'
+                                        '${_selectedPrompt == _activePrompt && _clipStatus.isNotEmpty ? ' · audio ready' : ''}'
+                                    : 'saved',
+                        style: const TextStyle(
+                          fontSize: 10,
+                          color: Color(0xFF9AA4B2),
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+          ],
           if (_sceneLen > 0) _sceneRow(),
           // Per-clip bars only for sources outside the authored score —
           // scene sources are scrubbed by the master bar above.
