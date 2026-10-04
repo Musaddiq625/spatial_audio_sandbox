@@ -26,6 +26,7 @@ class SourceDot {
     this.z = 0,
     this.delayS = 0,
     this.estDurS = 0,
+    this.endS,
     String? label,
   }) : label = label ?? kind.name;
   int? id; // live engine id — null while pending (scheduled, not yet
@@ -41,6 +42,14 @@ class SourceDot {
   /// (manual palette dots have 0 and stay off the master seekbar).
   double delayS;
   double estDurS;
+
+  /// Scene-time when the source stops sounding ("the fire goes out").
+  /// The ticker fades+removes the engine source; scrubbing back below
+  /// it revives the source. Null = never ends.
+  double? endS;
+  bool ended = false; // sceneT is past endS — paints dimmed on radar
+  bool ending = false; // fade-out in flight — re-entry guard
+
   DateTime? dueAt; // sceneT0 + delayS — set when the dot is pending
   bool adding = false; // async engine-add in flight — tick re-entry guard
   bool addFailed = false; // engine add threw — stops tick retries until
@@ -511,6 +520,7 @@ class _SandboxPageState extends State<SandboxPage> {
       label: label,
       delayS: spec?.delayS ?? 0,
       estDurS: spec?.durationS ?? 0,
+      endS: spec?.endS,
     );
     setState(() => _sources.add(dot));
     final delay = dot.delayS;
@@ -624,12 +634,19 @@ class _SandboxPageState extends State<SandboxPage> {
   }
 
   /// Composition length = latest authored end (delay + clip duration,
-  /// estimated until the real decode lands). 0 = no scene on the clock
-  /// (manual palette dots only).
+  /// estimated until the real decode lands), or an explicit end_s —
+  /// "the fire goes out at 12s" extends the scene to 12s even when the
+  /// fire's clip is shorter. 0 = no scene on the clock.
   double get _sceneLen => _sources.fold(
         0.0,
         (m, d) => d.estDurS > 0
-            ? math.max(m, d.delayS + (d.fileDurS ?? d.estDurS))
+            ? math.max(
+                m,
+                math.max(
+                  d.delayS + (d.fileDurS ?? d.estDurS),
+                  d.endS ?? 0,
+                ),
+              )
             : m,
       );
 
@@ -662,11 +679,18 @@ class _SandboxPageState extends State<SandboxPage> {
     if (mounted) setState(() {});
   }
 
-  /// Realize any pending/finished authored dots whose cue has arrived.
+  /// Scene-time sync: end sources past their end_s (fade → remove),
+  /// then realize any pending/finished dots whose cue has arrived.
   void _ensurePendingAdds() {
     if (!_engineOn) return;
     final t = _sceneT;
     for (final dot in _sources) {
+      final pastEnd = dot.endS != null && t >= dot.endS!;
+      dot.ended = pastEnd; // visual flag follows the score
+      if (pastEnd) {
+        _endDot(dot);
+        continue;
+      }
       if (!dot.needsSource || dot.adding || dot.addFailed) continue;
       final local = t - dot.delayS;
       if (local < 0) continue;
@@ -678,6 +702,26 @@ class _SandboxPageState extends State<SandboxPage> {
       }
       unawaited(_realizeAt(dot, local));
     }
+  }
+
+  /// Fade out a source whose end_s passed, then remove the engine
+  /// source once the smoothed gain has rung down. A scrub back below
+  /// end_s during the fade cancels the removal.
+  void _endDot(SourceDot dot) {
+    final id = dot.id;
+    if (id == null || dot.ending) return;
+    dot.ending = true;
+    setSourceGain(id: id, gain: 0);
+    debugPrint('[scene] ${dot.label}: ending at ${dot.endS}s');
+    unawaited(Future.delayed(const Duration(milliseconds: 400), () {
+      dot.ending = false;
+      // Still ended + same source? Remove it. A mid-fade scrub-back
+      // leaves dot.ended false or a fresh id — either way this is stale.
+      if (dot.ended && dot.id == id) {
+        if (_engineOn) removeSource(id: id);
+        dot.id = null;
+      }
+    }));
   }
 
   Future<void> _realizeAt(SourceDot dot, double local) async {
@@ -761,9 +805,11 @@ class _SandboxPageState extends State<SandboxPage> {
       );
       dot.addFailed = false;
       final local = t - dot.delayS;
-      if (local < 0) {
-        // Before its cue — go silent: drop the engine source, the dot
-        // becomes pending and re-realizes on a forward scrub/tick.
+      // Past its authored end ("the fire goes out") — same silence path
+      // as a source before its cue; scrubbing back revives it.
+      final pastEnd = dot.endS != null && t >= dot.endS!;
+      dot.ended = pastEnd;
+      if (local < 0 || pastEnd) {
         if (dot.id != null) {
           final id = dot.id!;
           dot.id = null;
@@ -777,13 +823,18 @@ class _SandboxPageState extends State<SandboxPage> {
         }
         continue;
       }
-      if (_engineOn && dot.isFile && dot.id != null && !dot.finished) {
-        final dur = dot.fileDurS ?? 0;
-        if (dur > 0) {
-          final pos = dot.looping ? local % dur : local.clamp(0.0, dur);
-          seekSource(id: dot.id!, posS: pos);
-          dot.fileT0 = DateTime.now()
-              .subtract(Duration(milliseconds: (pos * 1000).round()));
+      if (_engineOn && dot.id != null && !dot.finished) {
+        // Restore gain — cancels a mid-fade end and the scrub preview
+        // mute in one idempotent write.
+        setSourceGain(id: dot.id!, gain: dot.gain);
+        if (dot.isFile) {
+          final dur = dot.fileDurS ?? 0;
+          if (dur > 0) {
+            final pos = dot.looping ? local % dur : local.clamp(0.0, dur);
+            seekSource(id: dot.id!, posS: pos);
+            dot.fileT0 = DateTime.now()
+                .subtract(Duration(milliseconds: (pos * 1000).round()));
+          }
         }
       }
     }
@@ -1549,12 +1600,14 @@ class _SandboxPageState extends State<SandboxPage> {
                 for (final s in _sources)
                   InputChip(
                     label: Text(
-                      s.pending && s.dueAt != null
-                          ? '${s.label} · in ${math.max(0, (s.delayS - _sceneT).ceil())}s'
-                          : s.label,
+                      s.ended
+                          ? '${s.label} · ended'
+                          : s.pending && s.dueAt != null
+                              ? '${s.label} · in ${math.max(0, (s.delayS - _sceneT).ceil())}s'
+                              : s.label,
                       style: TextStyle(
                         fontSize: 12,
-                        color: s.pending
+                        color: s.pending || s.ended
                             ? (_kindColors[s.kind] ?? Colors.white)
                                 .withValues(alpha: 0.45)
                             : _kindColors[s.kind] ?? Colors.white,
@@ -1793,9 +1846,10 @@ class _RadarPainter extends CustomPainter {
       }
       final p = center + v;
       final color = _kindColors[s.kind] ?? Colors.white;
-      // Pending sources (authored cue hasn't arrived) paint dimmed —
-      // the composed plan is visible before it sounds.
-      final a = s.pending ? 0.35 : 1.0;
+      // Pending sources (cue hasn't arrived) and ended ones paint
+      // dimmed — the composed plan is visible before and after it
+      // sounds.
+      final a = s.pending || s.ended ? 0.35 : 1.0;
       canvas.drawCircle(
         p,
         10,

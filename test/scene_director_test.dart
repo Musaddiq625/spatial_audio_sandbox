@@ -179,46 +179,4 @@ void main() {
     expect(s.sources[2].sound, 'campfire crackling');
   });
 
-  test('inferTiming maps "after N" cues onto later sources', () {
-    final s = SceneDirector.parseSpec('{"sources":['
-        '{"name":"rain","kind":"rain"},'
-        '{"name":"breeze","kind":"noise"},'
-        '{"name":"plane","kind":"noise"}]}');
-    SceneDirector.inferTiming(
-      s,
-      "I'm in rain, after 2 seconds a cold breeze, then a plane passes",
-    );
-    expect(s.sources[0].delayS, 0); // bed stays immediate
-    expect(s.sources[1].delayS, 2); // "after 2" → breeze
-    expect(s.sources[2].delayS, 4); // "then" → next staggered cue
-  });
-
-  test('inferTiming is a no-op without timing words or with model cues',
-      () {
-    final quiet = SceneDirector.parseSpec('{"sources":['
-        '{"kind":"rain"},{"kind":"bee"}]}');
-    SceneDirector.inferTiming(quiet, 'rain all around, a bee circling');
-    expect(quiet.sources.every((s) => s.delayS == 0), isTrue);
-
-    final authored = SceneDirector.parseSpec('{"sources":['
-        '{"kind":"rain"},{"kind":"noise","delay_s":7}]}');
-    SceneDirector.inferTiming(authored, 'rain, then after 2 seconds wind');
-    expect(authored.sources[1].delayS, 7); // model's delay_s wins
-  });
-
-  test('inferTiming zeroes model delays on untimed prompts', () {
-    // The model may copy few-shot delay values onto prompts that never
-    // asked for timing — with no timing words, delay_s can't be trusted.
-    final s = SceneDirector.parseSpec('{"sources":['
-        '{"kind":"rain"},{"kind":"noise","delay_s":2},'
-        '{"kind":"noise","delay_s":4}]}');
-    SceneDirector.inferTiming(s, 'rain, wind, and a plane overhead');
-    expect(s.sources.every((x) => x.delayS == 0), isTrue);
-  });
-
-  test('inferTiming applies "after N" to a single-source spec', () {
-    final s = SceneDirector.parseSpec('{"sources":[{"kind":"noise"}]}');
-    SceneDirector.inferTiming(s, 'after 3 seconds a dragon roars');
-    expect(s.sources.single.delayS, 3);
-  });
 }

@@ -36,6 +36,9 @@ struct SourceState {
     gen: Box<dyn Source>,
     pos: Vec3,
     gain: f32,
+    /// SetGain target — `gain` slews toward it per-sample (~20 ms ramp)
+    /// so fades and mutes don't click.
+    gain_target: f32,
     conv: XFadeConvolver,
     az_q: i32,
     el_q: i32,
@@ -50,6 +53,7 @@ impl SourceState {
             gen,
             pos,
             gain,
+            gain_target: gain,
             conv: XFadeConvolver::new(),
             az_q: i32::MIN,
             el_q: i32::MIN,
@@ -153,7 +157,7 @@ impl Mixer {
             }
             Cmd::SetGain { id, gain } => {
                 if let Some(s) = self.sources.iter_mut().find(|s| s.id == id) {
-                    s.gain = gain;
+                    s.gain_target = gain;
                 }
             }
             Cmd::Seek { id, pos_s } => {
@@ -231,19 +235,24 @@ impl Mixer {
                 s.dist_lp = OnePole::new(fc, self.sr);
                 s.last_fc = fc;
             }
-            let g = s.gain * Self::dist_gain(sph.dist);
-            if g <= 1e-5 {
-                // Still run the generator so loops keep phase, but skip conv.
-                for i in 0..n {
+            let dg = Self::dist_gain(sph.dist);
+            if s.gain.max(s.gain_target) * dg <= 1e-5 {
+                // Fully faded (target and current both ~0): still run
+                // the generator so loops keep phase, but skip conv.
+                // A ramping-up gain fails this check and ticks below.
+                for _ in 0..n {
                     s.gen.tick(self.sr);
-                    let _ = i;
                 }
                 continue;
             }
 
+            // Per-sample gain slew toward the target — ~20 ms ramp,
+            // click-free fades/mutes.
+            let slew = 1.0 - (-1.0f32 / (self.sr * 0.02)).exp();
             // n <= scratch.len() is guaranteed by the chunking in process().
             for i in 0..n {
-                self.scratch[i] = s.dist_lp.tick(s.gen.tick(self.sr)) * g;
+                s.gain += (s.gain_target - s.gain) * slew;
+                self.scratch[i] = s.dist_lp.tick(s.gen.tick(self.sr)) * s.gain * dg;
             }
             for i in 0..n {
                 let (l, r) = s.conv.tick(self.scratch[i]);
@@ -334,6 +343,31 @@ mod tests {
         mix.process(&mut buf);
         let (l_peak, r_peak) = peak_positions(&buf);
         assert!(l_peak < r_peak);
+    }
+
+    /// SetGain must slew (~20 ms), never jump — fades and the scrub
+    /// mute would click otherwise.
+    #[test]
+    fn gain_ramps_toward_target() {
+        let (mut mix, _slot, _tx) = standalone(SAMPLE_RATE);
+        mix.push_cmd(Cmd::Add {
+            id: 1,
+            gen: source::make(SourceKind::Tone),
+            pos: Vec3::new(1.0, 0.0, 0.0),
+            gain: 1.0,
+        });
+        mix.push_cmd(Cmd::SetGain { id: 1, gain: 0.5 });
+        let mut buf = [0f32; 480]; // 240 frames ≈ 5 ms — still mid-ramp
+        mix.process(&mut buf);
+        let g = mix.sources[0].gain;
+        assert!(g > 0.55 && g < 1.0, "5 ms in, gain should be mid-ramp: {g}");
+        let mut buf = [0f32; 19200]; // 9600 frames ≈ 200 ms — converged
+        mix.process(&mut buf);
+        assert!(
+            (mix.sources[0].gain - 0.5).abs() < 0.01,
+            "gain should reach target: {}",
+            mix.sources[0].gain
+        );
     }
 
     fn peak_positions(buf: &[f32]) -> (usize, usize) {

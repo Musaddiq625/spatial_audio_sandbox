@@ -8,6 +8,7 @@ import 'package:flutter/foundation.dart';
 import '../rust/api/engine.dart';
 import 'llm_client.dart';
 import 'motion.dart';
+import 'scene_compiler.dart';
 import 'sfx_client.dart';
 
 /// Per-source SFX generation status, surfaced to the UI.
@@ -25,6 +26,7 @@ class SpecSource {
     this.orbit,
     this.approach,
     this.traverse,
+    this.wander,
     this.sound,
     this.loop = true,
     this.durationS = 6,
@@ -40,6 +42,7 @@ class SpecSource {
   OrbitMotion? orbit;
   ApproachMotion? approach;
   TraverseMotion? traverse;
+  WanderMotion? wander;
 
   /// Free-text audio description for the SFX generator. When set, the
   /// procedural [kind] plays instantly as a stand-in and is swapped for
@@ -57,6 +60,11 @@ class SpecSource {
   /// (no engine source) until the scene clock reaches it.
   double delayS;
 
+  /// Authored end: scene-time when the source stops sounding ("the
+  /// fire goes out"). Null = never ends. The page fades and removes
+  /// the engine source when the scene clock passes it.
+  double? endS;
+
   /// Scene coords: +x front, +y left, +z up. Az 0 = front, +90 = left.
   Offset get pos2d {
     final az = azDeg * math.pi / 180;
@@ -71,10 +79,21 @@ class SpecSource {
 }
 
 class OrbitMotion {
-  OrbitMotion({required this.radiusM, required this.periodS, this.phaseDeg = 0});
+  OrbitMotion({
+    required this.radiusM,
+    required this.periodS,
+    this.phaseDeg = 0,
+    this.centerAzDeg = 0,
+    this.centerDistM = 0,
+  });
   double radiusM;
   double periodS;
   double phaseDeg;
+
+  /// Orbit center — defaults to the listener's head (0,0). An anchored
+  /// orbit circles the anchor ("around the fire"), not the head.
+  double centerAzDeg;
+  double centerDistM;
 }
 
 class ApproachMotion {
@@ -101,6 +120,10 @@ class TraverseMotion {
 class SceneSpec {
   SceneSpec(this.sources);
   final List<SpecSource> sources;
+
+  /// Where the scene is set ("cave", "night market") — appended to
+  /// generated sound prompts so clips match the environment.
+  String? environment;
 }
 
 class SpecException implements Exception {
@@ -229,8 +252,15 @@ class SceneDirector {
         onProgress: onProgress,
       );
       SceneSpec spec;
+      // Existing names ground refine() — a follow-up that doesn't
+      // re-mention a source shouldn't drop it.
+      final ground = _byName.keys.toList();
       try {
-        spec = parseSpec(raw);
+        spec = SceneCompiler.compile(
+          SceneCompiler.parseScreenplay(raw),
+          p,
+          extraGround: ground,
+        );
       } on SpecException catch (e) {
         // One retry with the parse error fed back to the model.
         final raw2 = await llm.complete(
@@ -239,9 +269,12 @@ class SceneDirector {
           jsonSchema: _specJsonSchema,
           onProgress: onProgress,
         );
-        spec = parseSpec(raw2);
+        spec = SceneCompiler.compile(
+          SceneCompiler.parseScreenplay(raw2),
+          p,
+          extraGround: ground,
+        );
       }
-      inferTiming(spec, p);
       await apply(spec);
       debugPrint(
         '[director] spec applied: ${spec.sources.map((s) => '${s.name}(kind:${s.kind.name},sound:${s.sound},loop:${s.loop},dur:${s.durationS},az:${s.azDeg},dist:${s.distM},mot:${s.orbit != null ? 'orbit' : s.approach != null ? 'approach' : s.traverse != null ? 'traverse' : 'none'})').join(' | ')}',
@@ -257,47 +290,6 @@ class SceneDirector {
       _busy = false;
     }
     return null;
-  }
-
-  /// Delay-trust guard + deterministic timing fallback:
-  /// 1. No timing words in the prompt → force every delay_s to 0 — the
-  ///    schema requires the field so the model must emit *something*,
-  ///    and it may copy few-shot values onto untimed prompts. An
-  ///    untimed prompt means an untimed scene.
-  /// 2. Timing words + any model delay > 0 → trust the model.
-  /// 3. Timing words + all delays 0 (a common 1B miss) → infer:
-  ///    explicit "after N" numbers map onto later sources in spec
-  ///    order (or the single source itself), remaining sources
-  ///    stagger by 2s.
-  static void inferTiming(SceneSpec spec, String prompt) {
-    final hasCue =
-        RegExp(r'\b(after|then|later|suddenly|eventually)\b',
-            caseSensitive: false)
-        .hasMatch(prompt);
-    if (!hasCue) {
-      for (final s in spec.sources) {
-        s.delayS = 0;
-      }
-      return;
-    }
-    if (spec.sources.any((s) => s.delayS > 0)) return;
-    final cues = RegExp(r'after\s*(\d+(?:\.\d+)?)', caseSensitive: false)
-        .allMatches(prompt)
-        .map((m) => double.parse(m.group(1)!))
-        .toList();
-    // Single-source spec: the cue applies to it directly. Multi-source:
-    // index 0 is the ambience bed and stays at 0.
-    final start = spec.sources.length < 2 ? 0 : 1;
-    for (var i = start; i < spec.sources.length; i++) {
-      final j = i - start;
-      spec.sources[i].delayS = j < cues.length
-          ? cues[j]
-          : (cues.isEmpty
-              ? (j + 1) * 2.0
-              : cues.last + 2 * (j - cues.length + 1));
-    }
-    debugPrint('[director] inferred timing from prompt: '
-        '${spec.sources.map((s) => '${s.name}=${s.delayS}s').join(', ')}');
   }
 
   /// Direct apply — used by preset chips (no model call).
@@ -334,7 +326,9 @@ class SceneDirector {
             )
           : s.traverse != null
               ? _traversePos(s, 0)
-              : (s.orbit != null ? _orbitPos(s, 0) : s.pos2d);
+              : s.wander != null
+                  ? _wanderPos(s, 0)
+                  : (s.orbit != null ? _orbitPos(s, 0) : s.pos2d);
       final key = await add(s.kind, start, s.z, s.gain,
           label: s.name, spec: s);
       if (key == null) continue;
@@ -357,10 +351,15 @@ class SceneDirector {
   /// traverse/orbit begins as the real audio lands — not at apply time.
   Future<void> _genFor(SpecSource s, Object key) async {
     onStatus?.call(s.name, SfxStatus.generating);
-    debugPrint('[sfx] ${s.name}: generating "${s.sound}" (${s.durationS}s, loop=${s.loop})');
+    // Environment context: "in a cave" reaches the sound generator —
+    // a fire in a cave should sound different from a beach bonfire.
+    final env = _lastSpec?.environment;
+    final text =
+        env == null ? s.sound! : '${s.sound}, ${_envText(env)}';
+    debugPrint('[sfx] ${s.name}: generating "$text" (${s.durationS}s, loop=${s.loop})');
     try {
       final bytes = await sfx!.generate(
-        s.sound!,
+        text,
         durationSeconds: s.durationS,
         loop: s.loop,
       );
@@ -397,6 +396,22 @@ class SceneDirector {
       onError('sfx ${s.name}: $e');
     }
   }
+
+  /// Environment → a short acoustic context appended to every SFX
+  /// request. The cache key includes it, so the same "fire" in a cave
+  /// and on a beach are different clips.
+  static String _envText(String env) => switch (env.toLowerCase()) {
+        'cave' || 'cavern' || 'tunnel' => 'inside a large cave, echoing',
+        'forest' || 'woods' || 'jungle' => 'in a dense forest',
+        'city' || 'street' || 'urban' || 'market' ||
+        'night market' =>
+          'on a busy city street',
+        'beach' || 'ocean' || 'sea' || 'harbor' => 'on a beach by the ocean',
+        'room' || 'house' || 'indoors' || 'hall' => 'indoors in a room',
+        'mountain' || 'peak' || 'summit' => 'on an open mountainside',
+        'desert' || 'dune' => 'in an open desert',
+        _ => 'in a $env',
+      };
 
   /// Follow-up prompt mutates the current spec instead of replacing it.
   Future<void> refine(String prompt) async {
@@ -436,13 +451,25 @@ class SceneDirector {
 
   void dispose() => _motion.stopAll();
 
+  Offset _wanderPos(SpecSource s, double t) {
+    final w = s.wander!;
+    final az = w.anchorAzDeg * math.pi / 180;
+    final el = w.anchorElDeg * math.pi / 180;
+    return Offset(
+      w.anchorDistM * math.cos(el) * math.cos(az),
+      w.anchorDistM * math.cos(el) * math.sin(az),
+    );
+  }
+
   Offset _orbitPos(SpecSource s, double t) {
     final o = s.orbit!;
     final th = 2 * math.pi * t / o.periodS + o.phaseDeg * math.pi / 180;
     final el = s.elDeg * math.pi / 180;
+    final cx = o.centerDistM * math.cos(o.centerAzDeg * math.pi / 180);
+    final cy = o.centerDistM * math.sin(o.centerAzDeg * math.pi / 180);
     return Offset(
-      o.radiusM * math.cos(el) * math.cos(th),
-      o.radiusM * math.cos(el) * math.sin(th),
+      cx + o.radiusM * math.cos(el) * math.cos(th),
+      cy + o.radiusM * math.cos(el) * math.sin(th),
     );
   }
 
@@ -457,6 +484,7 @@ class SceneDirector {
   /// Spec → JSON map; round-trips through [parseSpec]. Used by prompt
   /// history persistence and by refine()'s "current scene" echo.
   static Map<String, Object?> specToJson(SceneSpec spec) => {
+        if (spec.environment != null) 'environment': spec.environment,
         'sources': spec.sources.map(_sourceJson).toList(),
       };
 
@@ -471,9 +499,28 @@ class SceneDirector {
         'loop': s.loop,
         'duration_s': s.durationS,
         'delay_s': s.delayS,
+        if (s.endS != null) 'end_s': s.endS,
         if (s.orbit != null)
           'motion': {
-            'orbit': {'radius': s.orbit!.radiusM, 'period_s': s.orbit!.periodS}
+            'orbit': {
+              'radius': s.orbit!.radiusM,
+              'period_s': s.orbit!.periodS,
+              if (s.orbit!.centerDistM != 0)
+                'center_az': s.orbit!.centerAzDeg,
+              if (s.orbit!.centerDistM != 0)
+                'center_dist': s.orbit!.centerDistM,
+            }
+          }
+        else if (s.wander != null)
+          'motion': {
+            'wander': {
+              'anchor_az': s.wander!.anchorAzDeg,
+              'anchor_el': s.wander!.anchorElDeg,
+              'anchor_dist': s.wander!.anchorDistM,
+              'az_span': s.wander!.azSpanDeg,
+              'dist_span': s.wander!.distSpanM,
+              'period_s': s.wander!.periodS,
+            }
           }
         else if (s.approach != null)
           'motion': {
@@ -585,6 +632,8 @@ class SceneDirector {
       if (e['loop'] is bool) s.loop = e['loop'] as bool;
       s.durationS = _clampNum(e['duration_s'], 0.5, 12, 6);
       s.delayS = _clampNum(e['delay_s'], 0, 120, 0);
+      final endS = e['end_s'];
+      if (endS is num) s.endS = endS.toDouble();
       final motion = e['motion'];
       if (motion is Map) {
         final o = motion['orbit'];
@@ -593,6 +642,19 @@ class SceneDirector {
             radiusM: _clampNum(o['radius'], 0.3, 8, 0.6),
             periodS: _clampNum(o['period_s'], 4, 120, 8),
             phaseDeg: _clampNum(o['phase'], 0, 360, 0),
+            centerAzDeg: _clampNum(o['center_az'], -180, 180, 0),
+            centerDistM: _clampNum(o['center_dist'], 0, 30, 0),
+          );
+        }
+        final w = motion['wander'];
+        if (w is Map) {
+          s.wander = WanderMotion(
+            anchorAzDeg: _clampNum(w['anchor_az'], -180, 180, s.azDeg),
+            anchorElDeg: _clampNum(w['anchor_el'], -90, 90, s.elDeg),
+            anchorDistM: _clampNum(w['anchor_dist'], 0.3, 30, s.distM),
+            azSpanDeg: _clampNum(w['az_span'], 0, 90, 30),
+            distSpanM: _clampNum(w['dist_span'], 0, 5, 0.4),
+            periodS: _clampNum(w['period_s'], 2, 60, 7),
           );
         }
         final a = motion['approach'];
@@ -615,7 +677,12 @@ class SceneDirector {
       }
       sources.add(s);
     }
-    return SceneSpec(sources);
+    final spec = SceneSpec(sources);
+    final env = decoded['environment'];
+    if (env is String && env.trim().isNotEmpty) {
+      spec.environment = env.trim();
+    }
+    return spec;
   }
 
   static double _clampNum(Object? v, double lo, double hi, double dflt) {
@@ -623,35 +690,57 @@ class SceneDirector {
     return n.clamp(lo, hi);
   }
 
-  /// JSON schema for llama.cpp constrained decoding — the model cannot emit
-  /// a `kind` outside the enum or malformed structure. Range clamps in
-  /// [parseSpec] still apply for value sanity.
+  /// JSON schema for llama.cpp constrained decoding — a "screenplay"
+  /// of fixed choices. The model picks from enums, so it cannot emit
+  /// nonsense azimuths, copy motion onto static sources, or produce
+  /// malformed structure. The compiler turns choices into geometry
+  /// and verifies each source against the prompt.
+  /// Public for tool/eval_prompts.dart — the live-check harness must
+  /// use the exact production schema, not a copy that can drift.
+  static const specJsonSchema = _specJsonSchema;
+  static const systemPrompt = _systemPrompt;
+
   static const _specJsonSchema = {
     'type': 'object',
     'properties': {
+      'environment': {'type': 'string'},
       'sources': {
         'type': 'array',
-        'maxItems': 8,
+        'maxItems': 10,
         'items': {
           'type': 'object',
           'properties': {
             'name': {'type': 'string'},
-            'kind': {
-              'enum': ['bee', 'rain', 'pad', 'tone', 'noise'],
-            },
-            'az': {'type': 'number'},
-            'el': {'type': 'number'},
-            'dist': {'type': 'number'},
-            'gain': {'type': 'number'},
             'sound': {'type': 'string'},
+            'role': {
+              'enum': [
+                'ambience', 'object', 'creature', 'person', 'vehicle',
+                'weather', 'event',
+              ],
+            },
+            'place': {
+              'enum': [
+                'front', 'front_left', 'left', 'back_left', 'behind',
+                'back_right', 'right', 'front_right', 'above', 'around',
+              ],
+            },
+            'distance': {'enum': ['close', 'near', 'far']},
+            'movement': {
+              'enum': [
+                'still', 'wander', 'circle', 'approach',
+                'pass_left_to_right', 'pass_right_to_left',
+                'pass_overhead',
+              ],
+            },
+            'start': {'enum': ['beginning', 'after_seconds', 'later']},
+            'start_s': {'type': 'number'},
+            'ends': {'enum': ['never', 'after_seconds', 'with_event']},
+            'end_s': {'type': 'number'},
             'loop': {'type': 'boolean'},
-            'duration_s': {'type': 'number'},
-            'delay_s': {'type': 'number'},
-            'motion': {'type': 'object'},
           },
           'required': [
-            'name', 'kind', 'sound', 'loop', 'duration_s', 'delay_s',
-            'az', 'el', 'dist', 'gain',
+            'name', 'sound', 'role', 'place', 'distance', 'movement',
+            'start', 'ends', 'loop',
           ],
         },
       },
@@ -660,21 +749,24 @@ class SceneDirector {
   };
 
   static const _systemPrompt = '''
-You are the scene director for a binaural audio app. Turn the user's description into a JSON scene spec — output ONLY the JSON object, no prose.
+You are the scene director for a binaural audio app. Turn the user's description into a JSON screenplay — output ONLY the JSON object, no prose.
 
-Kinds: bee (any buzzing insect — fly, mosquito, wasp), rain (steady hiss+droplets, good surround bed), pad (warm slow chord), tone (pure sine), noise (static/wind/ocean/waterfall texture). Map fanciful requests to the nearest kind ("ocean"→noise, "campfire"→noise, "meditation"→pad).
+List every sound the user describes — ONLY sounds they describe, never invented ones. Name each source after the thing making the sound ("dragon", "kids"), never a type word.
 
-Coordinates: az=0 front, +90 left, -90 right, ±180 behind. el=+deg above the head plane. dist in meters (0.3 close-up … 30 far). At most 6 sources, and ONLY ones the user actually described — never add filler sources they didn't mention. Name each source after the thing making the sound ("dragon", "kids", "helicopter") — never after a kind name ("pad", "tone", "noise" are forbidden as names). Orbit periods ≥4s or the spatial image smears. Words like "behind"/"left"/"above" must be reflected in az/el.
+Fields per source:
+- "sound": a short literal description for a sound-effects generator ("campfire crackling on dry wood", "children playing outdoors").
+- "role": ambience (weather or background beds), object (things — fire, clock, radio), creature, person, vehicle, weather, event (a one-shot occurrence — an impact, a roar, or a transition like "the fire goes out").
+- "place": front, front_left, left, back_left, behind, back_right, right, front_right, above, or around (all around the listener). Match the user's spatial words exactly.
+- "distance": close (arm's reach), near (a few steps away), or far (across the space).
+- "movement": still unless the user says it moves — wander (moving about near its spot), circle (circling), approach (coming closer), pass_left_to_right, pass_right_to_left, or pass_overhead.
+- "start": beginning, later (an unspecified later time), or after_seconds with "start_s" (the user gave an exact time).
+- "ends": never, after_seconds with "end_s", or with_event (the user says it goes out, dies, or stops).
+- "loop": true for continuous sounds, false for one-shot events.
 
-Per-source motion — whenever the user says a source orbits, approaches, flies past, or crosses space (left→right, front→behind, sweeping by), you MUST attach a "motion" object to that source: "motion":{"orbit":{"radius":m,"period_s":s}} for circling, "motion":{"approach":{"from_az":deg,"from_dist":m,"seconds":s}} for a source flying toward the listener, or "motion":{"traverse":{"from_az":deg,"to_az":deg,"dist":m,"seconds":s}} for a source crossing space. A source described as moving but left without "motion" is a bug — static sources have no "motion" key.
-
-Every source MUST have "sound": a short literal audio description for a sound-effects generator ("campfire crackling on dry wood", "children playing outdoors", "dragon roar with heavy wing beats"). Never omit it. "loop":true for continuous ambience (beds, weather, crowds), false for one-shot events (a flyby, a roar, thunder). "duration_s": 4-10 for loops, 3-6 for one-shots.
-
-Timing: "delay_s" = seconds after scene start when the source becomes audible (0 = immediately). Ambience beds always get 0. When the user sequences events ("after 2 seconds", "then", "later", "suddenly", "first X then Y"), set delay_s on the later sources — never on ambience. Never omit delay_s.
+Also output "environment": where the scene is set ("cave", "forest", "night market") — one or two words.
 
 Examples:
-"rain all around, bee circling close in front" → {"sources":[{"name":"rain","kind":"rain","sound":"steady rain falling outdoors","loop":true,"duration_s":8,"delay_s":0,"az":0,"el":0,"dist":2.0,"gain":1.0},{"name":"bee","kind":"bee","sound":"bee buzzing","loop":true,"duration_s":6,"delay_s":0,"az":0,"el":0.2,"dist":0.5,"gain":1.0,"motion":{"orbit":{"radius":0.5,"period_s":6}}}]}
-"wind howling behind me, a fly around my head" → {"sources":[{"name":"wind","kind":"noise","sound":"cold wind howling","loop":true,"duration_s":8,"delay_s":0,"az":180,"el":0,"dist":8.0,"gain":0.8},{"name":"fly","kind":"bee","sound":"fly buzzing close","loop":true,"duration_s":6,"delay_s":0,"az":0,"el":0.2,"dist":0.5,"gain":1.0,"motion":{"orbit":{"radius":0.4,"period_s":5}}}]}
-"a dragon flying past me left to right, campfire in front" → {"sources":[{"name":"fire","kind":"noise","sound":"campfire crackling","loop":true,"duration_s":8,"delay_s":0,"az":0,"el":0,"dist":1.5,"gain":0.9},{"name":"dragon","kind":"noise","sound":"dragon roar with heavy wing beats","loop":false,"duration_s":6,"delay_s":0,"az":0,"el":10,"dist":2.5,"gain":1.0,"motion":{"traverse":{"from_az":-80,"to_az":80,"dist":2.5,"seconds":6}}}]}
-"I'm in rain, after 2 seconds a cold breeze, then a plane crosses left to right" → {"sources":[{"name":"rain","kind":"rain","sound":"steady rain falling outdoors","loop":true,"duration_s":8,"delay_s":0,"az":0,"el":0,"dist":2.0,"gain":1.0},{"name":"breeze","kind":"noise","sound":"cold breeze gust","loop":true,"duration_s":6,"delay_s":2,"az":-40,"el":0,"dist":1.5,"gain":0.8},{"name":"plane","kind":"noise","sound":"jet plane flyby overhead","loop":false,"duration_s":6,"delay_s":4,"az":-80,"el":40,"dist":8.0,"gain":1.0,"motion":{"traverse":{"from_az":-80,"to_az":80,"dist":8,"seconds":5}}}]}''';
+"in a harbor: gulls overhead, a foghorn far behind me, rope creaking close to my left" → {"environment":"harbor","sources":[{"name":"gulls","sound":"seagulls calling","role":"creature","place":"above","distance":"far","movement":"still","start":"beginning","ends":"never","loop":true},{"name":"foghorn","sound":"deep ship foghorn blowing","role":"object","place":"behind","distance":"far","movement":"still","start":"beginning","ends":"never","loop":false},{"name":"rope","sound":"thick rope creaking under tension","role":"object","place":"left","distance":"close","movement":"still","start":"beginning","ends":"never","loop":true}]}
+"at a night market, crowd chatter all around, later a bell rings, then a scooter passes left to right" → {"environment":"night market","sources":[{"name":"crowd","sound":"market crowd chatter","role":"ambience","place":"around","distance":"near","movement":"still","start":"beginning","ends":"never","loop":true},{"name":"bell","sound":"small brass bell ringing twice","role":"event","place":"right","distance":"near","movement":"still","start":"later","ends":"never","loop":false},{"name":"scooter","sound":"scooter engine passing by","role":"vehicle","place":"left","distance":"near","movement":"pass_left_to_right","start":"later","ends":"never","loop":false}]}
+"beside a waterfall, after 4 seconds thunder cracks above, and the radio fades out" → {"environment":"waterfall","sources":[{"name":"waterfall","sound":"waterfall rushing over rocks","role":"weather","place":"around","distance":"far","movement":"still","start":"beginning","ends":"never","loop":true},{"name":"thunder","sound":"thunder crack rolling","role":"event","place":"above","distance":"far","movement":"still","start":"after_seconds","start_s":4,"ends":"never","loop":false},{"name":"radio","sound":"old radio static and music","role":"object","place":"front","distance":"near","movement":"still","start":"beginning","ends":"with_event","loop":true}]}''';
 }

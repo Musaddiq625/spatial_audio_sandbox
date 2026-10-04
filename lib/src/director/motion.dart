@@ -4,6 +4,26 @@ import 'dart:ui';
 
 import 'scene_director.dart' show SpecSource;
 
+/// Slow drift around an anchor — "kids running around behind me" stays
+/// *behind you* instead of circling your head. Two incommensurate sine
+/// sums on azimuth and distance give organic, non-repeating motion.
+class WanderMotion {
+  WanderMotion({
+    required this.anchorAzDeg,
+    this.anchorElDeg = 0,
+    required this.anchorDistM,
+    this.azSpanDeg = 30,
+    this.distSpanM = 0.4,
+    this.periodS = 7,
+  });
+  double anchorAzDeg;
+  double anchorElDeg;
+  double anchorDistM;
+  double azSpanDeg;
+  double distSpanM;
+  double periodS;
+}
+
 /// One directed source: opaque page-side handle + its spec + the position
 /// setter. The key resolves to the live engine id inside [setPos], so
 /// engine restarts (which re-assign ids) keep working.
@@ -81,7 +101,9 @@ class MotionBank {
       final dt = t.difference(e.t0).inMilliseconds / 1000.0;
       final s = e.spec;
       Offset p;
-      if (s.orbit != null) {
+      if (s.wander != null) {
+        p = _wander(s, dt);
+      } else if (s.orbit != null) {
         p = _orbit(s, dt);
       } else if (s.approach != null) {
         p = _approach(s, dt);
@@ -94,13 +116,35 @@ class MotionBank {
     }
   }
 
+  Offset _wander(SpecSource s, double t) {
+    final w = s.wander!;
+    // Two incommensurate sines — reads as aimless movement, not a
+    // mechanical ellipse.
+    final az = (w.anchorAzDeg +
+            math.sin(2 * math.pi * t / w.periodS) * w.azSpanDeg) *
+        math.pi /
+        180;
+    final dist = w.anchorDistM +
+        math.sin(2 * math.pi * t / (w.periodS * 1.37) + 1.3) *
+            w.distSpanM;
+    final el = w.anchorElDeg * math.pi / 180;
+    return Offset(
+      dist * math.cos(el) * math.cos(az),
+      dist * math.cos(el) * math.sin(az),
+    );
+  }
+
   Offset _orbit(SpecSource s, double t) {
     final o = s.orbit!;
     final th = 2 * math.pi * t / o.periodS + o.phaseDeg * math.pi / 180;
     final el = s.elDeg * math.pi / 180;
+    // Orbit center: head (0,0) or the source's anchor — "around the
+    // fire behind you" circles the fire, not your head.
+    final cx = o.centerDistM * math.cos(o.centerAzDeg * math.pi / 180);
+    final cy = o.centerDistM * math.sin(o.centerAzDeg * math.pi / 180);
     return Offset(
-      o.radiusM * math.cos(el) * math.cos(th),
-      o.radiusM * math.cos(el) * math.sin(th),
+      cx + o.radiusM * math.cos(el) * math.cos(th),
+      cy + o.radiusM * math.cos(el) * math.sin(th),
     );
   }
 
