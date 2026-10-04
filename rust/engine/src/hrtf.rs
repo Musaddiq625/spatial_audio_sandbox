@@ -138,18 +138,23 @@ impl SyntheticHrirSet {
 
     fn synthesize(sr: f32, az_deg: f32, el_deg: f32) -> Hrir {
         let abs_az = az_deg.abs();
-        // Lateral factor on a sin curve — the old linear |az|/90 ramp
-        // gave only ~2.5 dB at 45 deg; a real head is ~7-8 dB there.
-        // sin grows faster at mid angles: ~3.5 dB@20, ~8 dB@45, ~12 dB@90.
-        let s = (abs_az.min(90.0).to_radians()).sin();
+        // Lateral factor on a sin curve over the FULL circle — the old
+        // min(90) clamp pinned it at max across the whole rear hemi-
+        // sphere, so the ~12 dB near/far split never came back to
+        // symmetric behind the head and the ear assignment flipped at
+        // the +-180 seam: an audible instant ear-swap on rear traverses.
+        // sin falls back to 0 at 180 deg, matching ITD's behavior.
+        let s = abs_az.to_radians().sin();
         // Rear factor: 0 in front hemisphere, 1 directly behind.
         let rear = ((abs_az - 90.0) / 90.0).clamp(0.0, 1.0);
 
         let itd_samp = Self::itd_secs(abs_az) * sr;
         // Broadband level difference: ~12 dB max, weighted by the sin
-        // curve, plus a small rear penalty. Near ear gets a hair of
-        // lift — physical heads gain ~1 dB ipsilaterally at lateral.
-        let g_far = 10f32.powf(-(11.0 * s + 1.5 * rear) / 20.0);
+        // curve. Near ear gets a hair of lift — physical heads gain
+        // ~1 dB ipsilaterally at lateral. Both are s-driven, so at
+        // dead-rear (s = 0) the ears converge — no asymmetric term is
+        // allowed here or the seam stays discontinuous.
+        let g_far = 10f32.powf(-(11.0 * s) / 20.0);
         let g_near = 10f32.powf((1.2 * s) / 20.0);
         // Frequency-dependent shadow (Brown-Duda style): LF diffracts
         // around the head nearly unimpeded; HF is shelved off. The
@@ -254,6 +259,24 @@ mod tests {
         assert!(i30 > 4.0, "30 deg ILD too weak: {i30} dB");
         assert!(i45 > 6.5, "45 deg ILD too weak: {i45} dB");
         assert!(i90 > 10.0, "90 deg ILD too weak: {i90} dB");
+    }
+
+    /// Rear seam regression: at dead-rear both ears must converge —
+    /// the min(90)-clamped lateral factor used to hold ~13 dB of
+    /// near/far split all the way across the back and swap ears at
+    /// +-180, an audible instant flip on rear traverses.
+    #[test]
+    fn rear_is_near_symmetric_and_mirror_continuous() {
+        let set = SyntheticHrirSet::new(48_000.0);
+        let i180 = ild_db(&set, 179.0); // rounds to the 180 bin
+        assert!(i180 < 1.0, "rear ILD should collapse to ~0: {i180} dB");
+        // Straddling the seam, the two sides are mirror images.
+        let p = set.hrir((175f32).to_radians(), 0.0);
+        let m = set.hrir((-175f32).to_radians(), 0.0);
+        for i in 0..HRIR_LEN {
+            assert!((p.left[i] - m.right[i]).abs() < 1e-6, "seam mirror left/right {i}");
+            assert!((p.right[i] - m.left[i]).abs() < 1e-6, "seam mirror right/left {i}");
+        }
     }
 
     #[test]

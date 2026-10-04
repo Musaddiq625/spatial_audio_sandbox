@@ -465,11 +465,15 @@ impl Mixer {
             let dir = head.rotate(s.pos);
             let sph = Spherical::from_vec3(dir);
 
-            // Width: exaggerate the rendered azimuth (super-stereo
-            // trick — a 30 deg source spatializes like ~40 deg at 1.3)
-            // plus an extra contralateral cut below. Soft-clamped so a
-            // lateral source never wraps to the rear.
-            let az_e = (sph.az * self.width).clamp(-2.1, 2.1);
+            // Width: exaggerate the LATERAL COMPONENT, not the angle —
+            // atan2(sin*w, cos) pulls mid angles toward the side (a 30
+            // deg source spatializes like ~37 deg at 1.3) while rear
+            // sources stay rear and converge symmetrically at +-180.
+            // The old az*width clamped at +-120 deg collapsed the whole
+            // rear hemisphere onto two points and jumped ear-to-ear at
+            // the seam.
+            let (sy, cy) = sph.az.sin_cos();
+            let az_e = (sy * self.width).atan2(cy);
             // Retarget the convolver when the quantized direction moved.
             let az_q = (az_e.to_degrees() / 5.0).round() as i32;
             let el_q = (sph.el.to_degrees() / 15.0).round() as i32;
@@ -894,6 +898,52 @@ mod tests {
             wide > narrow * 1.5,
             "width 2.0 should deepen separation vs 0.6: {narrow} -> {wide}"
         );
+    }
+
+    /// Rear-traverse regression: sweeping a source across the +-180
+    /// seam must never flip the ears at once. Two stacked bugs made it
+    /// do exactly that: the HRTF kept max near/far split across the
+    /// rear hemisphere, and width exaggeration clamped az at +-120 deg
+    /// so the rendered direction leapt between fixed points. Now ears
+    /// converge at dead-rear and the mapping is continuous.
+    #[test]
+    fn rear_traverse_never_jumps_between_ears() {
+        fn lr_db(mix: &mut Mixer) -> f32 {
+            let mut buf = vec![0.0f32; 960 * 2];
+            mix.process(&mut buf);
+            let l: f32 = buf.iter().step_by(2).map(|x| x * x).sum::<f32>().sqrt();
+            let r: f32 = buf.iter().skip(1).step_by(2).map(|x| x * x).sum::<f32>().sqrt();
+            20.0 * (l / r.max(1e-9)).log10()
+        }
+        let (mut mix, _slot, mut tx, _trash, _status) = standalone(SAMPLE_RATE);
+        tx.push(Cmd::SetWet { wet: 0.0 }).unwrap();
+        tx.push(Cmd::add(
+            1,
+            source::make(SourceKind::Noise),
+            Vec3::new(-1.0, 0.3, 0.0), // ~163 deg left, behind
+            1.0,
+            SAMPLE_RATE,
+        ))
+        .unwrap();
+        let mut prev = lr_db(&mut mix);
+        // Sweep az +160 -> +180 -> -160 in 5 deg steps (through the seam).
+        for k in 1..=64 {
+            let az_deg = 160.0 + 5.0 * k as f32;
+            let az_wrapped = ((az_deg + 180.0).rem_euclid(360.0)) - 180.0;
+            let a = az_wrapped.to_radians();
+            tx.push(Cmd::SetPos {
+                id: 1,
+                pos: Vec3::new(a.cos(), a.sin(), 0.0),
+            })
+            .unwrap();
+            let cur = lr_db(&mut mix);
+            let jump = (cur - prev).abs();
+            assert!(
+                jump < 4.0,
+                "L/R ratio jumped {jump:.1} dB at az {az_wrapped:.0} deg"
+            );
+            prev = cur;
+        }
     }
 
     // ── Diagnostic session ─────────────────────────────────────────
