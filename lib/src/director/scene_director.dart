@@ -28,6 +28,7 @@ class SpecSource {
     this.sound,
     this.loop = true,
     this.durationS = 6,
+    this.delayS = 0,
   });
 
   final String name;
@@ -50,6 +51,11 @@ class SpecSource {
 
   /// Requested clip length — clamped to the SFX budget (≤12 s).
   double durationS;
+
+  /// Authored cue: seconds after scene start when this source becomes
+  /// audible. 0 = plays immediately. The page keeps the dot pending
+  /// (no engine source) until the scene clock reaches it.
+  double delayS;
 
   /// Scene coords: +x front, +y left, +z up. Az 0 = front, +90 = left.
   Offset get pos2d {
@@ -135,14 +141,17 @@ class SceneDirector {
     this.sfx,
     this.upgrade,
     this.onStatus,
+    this.onSceneStart,
   });
 
-  /// (kind, x, y, z, gain, {label}) -> opaque page-side handle for the new
-  /// source. The handle must resolve the live engine id (ids are
-  /// re-assigned on engine restart). Returns null on failure.
+  /// (kind, x, y, z, gain, {label, spec}) -> opaque page-side handle for
+  /// the new source. The handle must resolve the live engine id (ids are
+  /// re-assigned on engine restart). Returns null on failure. [spec]
+  /// carries authored timing (delay_s) + estimated duration so the page
+  /// can schedule the source's audible start on the scene clock.
   final Future<Object?> Function(
       SourceKindWire kind, Offset pos, double z, double gain,
-      {String? label}) add;
+      {String? label, SpecSource? spec}) add;
   final void Function(Object key) remove;
   final void Function(Object key, Offset pos, double z) setPos;
   final void Function(String msg) onError;
@@ -159,10 +168,15 @@ class SceneDirector {
   /// Per-source generation status for the UI.
   final void Function(String name, SfxStatus status)? onStatus;
 
+  /// Fired at the top of every [apply] — the page anchors its scene
+  /// clock to this instant (same instant motion anchors use).
+  final void Function(DateTime t0)? onSceneStart;
+
   final _motion = MotionBank();
   final _owned = <Object>{};
   final _byName = <String, Object>{};
   SceneSpec? _lastSpec;
+  DateTime _applyT0 = DateTime.now();
   bool _busy = false;
 
   bool get busy => _busy;
@@ -171,6 +185,11 @@ class SceneDirector {
   /// Pause/resume motion ticks — call on engine stop/start so radar dots
   /// freeze while the engine is off and resume on restart.
   void setMotionPaused(bool v) => _motion.paused = v;
+
+  /// Re-anchor every tracked source's motion to [sceneT] — the master
+  /// seekbar scrubs the scene clock, so positions must follow the
+  /// score, not wall time.
+  void seekScene(double sceneT) => _motion.seekTo(sceneT);
 
   static const _kinds = {
     'bee': SourceKindWire.bee,
@@ -222,6 +241,7 @@ class SceneDirector {
         );
         spec = parseSpec(raw2);
       }
+      inferTiming(spec, p);
       await apply(spec);
       debugPrint(
         '[director] spec applied: ${spec.sources.map((s) => '${s.name}(kind:${s.kind.name},sound:${s.sound},loop:${s.loop},dur:${s.durationS},az:${s.azDeg},dist:${s.distM},mot:${s.orbit != null ? 'orbit' : s.approach != null ? 'approach' : s.traverse != null ? 'traverse' : 'none'})').join(' | ')}',
@@ -237,6 +257,33 @@ class SceneDirector {
       _busy = false;
     }
     return null;
+  }
+
+  /// When the prompt sequences events but the model left every delay_s
+  /// at 0 (a common 1B miss), infer cues deterministically: explicit
+  /// "after N" numbers map onto later sources in spec order, remaining
+  /// sources stagger by 2s. The model's own delay_s always wins — this
+  /// only fires when all of them are 0.
+  static void inferTiming(SceneSpec spec, String prompt) {
+    if (spec.sources.length < 2) return;
+    if (spec.sources.any((s) => s.delayS > 0)) return;
+    if (!RegExp(r'\b(after|then|later|suddenly|eventually)\b',
+            caseSensitive: false)
+        .hasMatch(prompt)) {
+      return;
+    }
+    final cues = RegExp(r'after\s*(\d+(?:\.\d+)?)', caseSensitive: false)
+        .allMatches(prompt)
+        .map((m) => double.parse(m.group(1)!))
+        .toList();
+    for (var i = 1; i < spec.sources.length; i++) {
+      final s = spec.sources[i];
+      s.delayS = i <= cues.length
+          ? cues[i - 1]
+          : (cues.isEmpty ? i * 2.0 : cues.last + 2 * (i - cues.length));
+    }
+    debugPrint('[director] inferred timing from prompt: '
+        '${spec.sources.map((s) => '${s.name}=${s.delayS}s').join(', ')}');
   }
 
   /// Direct apply — used by preset chips (no model call).
@@ -255,6 +302,8 @@ class SceneDirector {
   Future<void> apply(SceneSpec spec) async {
     clear();
     _lastSpec = spec;
+    _applyT0 = DateTime.now();
+    onSceneStart?.call(_applyT0);
     final wantSfx = spec.sources.any((s) => s.sound != null);
     final sfxOk = wantSfx && (sfx?.configured ?? false);
     debugPrint(
@@ -272,11 +321,19 @@ class SceneDirector {
           : s.traverse != null
               ? _traversePos(s, 0)
               : (s.orbit != null ? _orbitPos(s, 0) : s.pos2d);
-      final key = await add(s.kind, start, s.z, s.gain, label: s.name);
+      final key = await add(s.kind, start, s.z, s.gain,
+          label: s.name, spec: s);
       if (key == null) continue;
       _owned.add(key);
       _byName[s.name] = key;
-      _motion.track(DirectedSource(key: key, spec: s, setPos: setPos));
+      final ds = DirectedSource(key: key, spec: s, setPos: setPos);
+      // Motion is anchored to the source's *audible* start — for a
+      // delayed source the negative dt keeps traverse/approach parked
+      // at their from-position until its cue arrives.
+      ds.t0 = _applyT0.add(
+        Duration(milliseconds: (s.delayS * 1000).round()),
+      );
+      _motion.track(ds);
       // Stand-in is already playing — the real clip upgrades it in flight.
       if (s.sound != null && sfxOk) unawaited(_genFor(s, key));
     }
@@ -298,12 +355,20 @@ class SceneDirector {
         return;
       }
       upgrade?.call(key, bytes, s.loop);
-      _motion.restart(key);
+      // Motion re-anchors to when the real audio actually begins:
+      // a clip landing early keeps its scheduled cue (delay_s), a
+      // late clip starts fresh at land time.
+      final scheduled =
+          _applyT0.add(Duration(milliseconds: (s.delayS * 1000).round()));
+      final now = DateTime.now();
+      _motion.restartAt(key, now.isAfter(scheduled) ? now : scheduled);
       debugPrint('[sfx] ${s.name}: ${bytes.length}B — live');
       onStatus?.call(s.name, SfxStatus.ready);
-      if (!s.loop) {
-        // One-shot: the engine self-removes the finished source — drop
-        // the dot shortly after playback ends.
+      if (!s.loop && s.delayS == 0) {
+        // One-shot in an untimed scene: the engine self-removes the
+        // finished source — drop the dot shortly after playback ends.
+        // Authored scenes (delay_s > 0) keep the dot so the master
+        // seekbar can scrub back into its window and replay it.
         final holdMs = (s.durationS * 1000).round() + 1500;
         Future.delayed(Duration(milliseconds: holdMs), () {
           if (_owned.remove(key)) {
@@ -391,6 +456,7 @@ class SceneDirector {
         if (s.sound != null) 'sound': s.sound,
         'loop': s.loop,
         'duration_s': s.durationS,
+        'delay_s': s.delayS,
         if (s.orbit != null)
           'motion': {
             'orbit': {'radius': s.orbit!.radiusM, 'period_s': s.orbit!.periodS}
@@ -495,9 +561,16 @@ class SceneDirector {
         gain: _clampNum(e['gain'], 0, 1.5, 0.9),
       );
       final sound = (e['sound'] as String?)?.trim();
-      if (sound != null && sound.isNotEmpty) s.sound = sound;
+      // Garbage guard: a derailed generation can emit junk like "]" —
+      // no letters means no EL call, the source degrades to procedural.
+      if (sound != null &&
+          sound.length >= 2 &&
+          RegExp(r'[a-zA-Z]').hasMatch(sound)) {
+        s.sound = sound;
+      }
       if (e['loop'] is bool) s.loop = e['loop'] as bool;
       s.durationS = _clampNum(e['duration_s'], 0.5, 12, 6);
+      s.delayS = _clampNum(e['delay_s'], 0, 120, 0);
       final motion = e['motion'];
       if (motion is Map) {
         final o = motion['orbit'];
@@ -559,10 +632,11 @@ class SceneDirector {
             'sound': {'type': 'string'},
             'loop': {'type': 'boolean'},
             'duration_s': {'type': 'number'},
+            'delay_s': {'type': 'number'},
             'motion': {'type': 'object'},
           },
           'required': [
-            'name', 'kind', 'sound', 'loop', 'duration_s',
+            'name', 'kind', 'sound', 'loop', 'duration_s', 'delay_s',
             'az', 'el', 'dist', 'gain',
           ],
         },
@@ -582,8 +656,11 @@ Per-source motion — whenever the user says a source orbits, approaches, flies 
 
 Every source MUST have "sound": a short literal audio description for a sound-effects generator ("campfire crackling on dry wood", "children playing outdoors", "dragon roar with heavy wing beats"). Never omit it. "loop":true for continuous ambience (beds, weather, crowds), false for one-shot events (a flyby, a roar, thunder). "duration_s": 4-10 for loops, 3-6 for one-shots.
 
+Timing: "delay_s" = seconds after scene start when the source becomes audible (0 = immediately). Ambience beds always get 0. When the user sequences events ("after 2 seconds", "then", "later", "suddenly", "first X then Y"), set delay_s on the later sources — never on ambience. Never omit delay_s.
+
 Examples:
-"rain all around, bee circling close in front" → {"sources":[{"name":"rain","kind":"rain","sound":"steady rain falling outdoors","loop":true,"duration_s":8,"az":0,"el":0,"dist":2.0,"gain":1.0},{"name":"bee","kind":"bee","sound":"bee buzzing","loop":true,"duration_s":6,"az":0,"el":0.2,"dist":0.5,"gain":1.0,"motion":{"orbit":{"radius":0.5,"period_s":6}}}]}
-"wind howling behind me, a fly around my head" → {"sources":[{"name":"wind","kind":"noise","sound":"cold wind howling","loop":true,"duration_s":8,"az":180,"el":0,"dist":8.0,"gain":0.8},{"name":"fly","kind":"bee","sound":"fly buzzing close","loop":true,"duration_s":6,"az":0,"el":0.2,"dist":0.5,"gain":1.0,"motion":{"orbit":{"radius":0.4,"period_s":5}}}]}
-"a dragon flying past me left to right, campfire in front" → {"sources":[{"name":"fire","kind":"noise","sound":"campfire crackling","loop":true,"duration_s":8,"az":0,"el":0,"dist":1.5,"gain":0.9},{"name":"dragon","kind":"noise","sound":"dragon roar with heavy wing beats","loop":false,"duration_s":6,"az":0,"el":10,"dist":2.5,"gain":1.0,"motion":{"traverse":{"from_az":-80,"to_az":80,"dist":2.5,"seconds":6}}}]}''';
+"rain all around, bee circling close in front" → {"sources":[{"name":"rain","kind":"rain","sound":"steady rain falling outdoors","loop":true,"duration_s":8,"delay_s":0,"az":0,"el":0,"dist":2.0,"gain":1.0},{"name":"bee","kind":"bee","sound":"bee buzzing","loop":true,"duration_s":6,"delay_s":0,"az":0,"el":0.2,"dist":0.5,"gain":1.0,"motion":{"orbit":{"radius":0.5,"period_s":6}}}]}
+"wind howling behind me, a fly around my head" → {"sources":[{"name":"wind","kind":"noise","sound":"cold wind howling","loop":true,"duration_s":8,"delay_s":0,"az":180,"el":0,"dist":8.0,"gain":0.8},{"name":"fly","kind":"bee","sound":"fly buzzing close","loop":true,"duration_s":6,"delay_s":0,"az":0,"el":0.2,"dist":0.5,"gain":1.0,"motion":{"orbit":{"radius":0.4,"period_s":5}}}]}
+"a dragon flying past me left to right, campfire in front" → {"sources":[{"name":"fire","kind":"noise","sound":"campfire crackling","loop":true,"duration_s":8,"delay_s":0,"az":0,"el":0,"dist":1.5,"gain":0.9},{"name":"dragon","kind":"noise","sound":"dragon roar with heavy wing beats","loop":false,"duration_s":6,"delay_s":0,"az":0,"el":10,"dist":2.5,"gain":1.0,"motion":{"traverse":{"from_az":-80,"to_az":80,"dist":2.5,"seconds":6}}}]}
+"I'm in rain, after 2 seconds a cold breeze, then a plane crosses left to right" → {"sources":[{"name":"rain","kind":"rain","sound":"steady rain falling outdoors","loop":true,"duration_s":8,"delay_s":0,"az":0,"el":0,"dist":2.0,"gain":1.0},{"name":"breeze","kind":"noise","sound":"cold breeze gust","loop":true,"duration_s":6,"delay_s":2,"az":-40,"el":0,"dist":1.5,"gain":0.8},{"name":"plane","kind":"noise","sound":"jet plane flyby overhead","loop":false,"duration_s":6,"delay_s":4,"az":-80,"el":40,"dist":8.0,"gain":1.0,"motion":{"traverse":{"from_az":-80,"to_az":80,"dist":8,"seconds":5}}}]}''';
 }

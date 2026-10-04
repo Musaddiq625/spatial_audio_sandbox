@@ -1,3 +1,5 @@
+import 'dart:convert';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:spatial_audio_sandbox/src/director/scene_director.dart';
 import 'package:spatial_audio_sandbox/src/rust/api/engine.dart';
@@ -136,5 +138,71 @@ void main() {
       () => SceneDirector.parseSpec('{"sources":[{"a":{"b":1}'),
       throwsA(isA<SpecException>()),
     );
+  });
+
+  test('parses delay_s authored cues', () {
+    final s = SceneDirector.parseSpec('{"sources":['
+        '{"kind":"rain","delay_s":0},'
+        '{"kind":"noise","delay_s":2},'
+        '{"kind":"noise","delay_s":4.5}]}');
+    expect(s.sources[0].delayS, 0);
+    expect(s.sources[1].delayS, 2);
+    expect(s.sources[2].delayS, 4.5);
+  });
+
+  test('defaults and clamps delay_s', () {
+    final s = SceneDirector.parseSpec('{"sources":['
+        '{"kind":"rain"},'
+        '{"kind":"noise","delay_s":-5},'
+        '{"kind":"noise","delay_s":999}]}');
+    expect(s.sources[0].delayS, 0); // missing → immediate
+    expect(s.sources[1].delayS, 0); // negative → clamped
+    expect(s.sources[2].delayS, 120); // capped
+  });
+
+  test('delay_s round-trips through specToJson', () {
+    final s = SceneDirector.parseSpec('{"sources":['
+        '{"name":"breeze","kind":"noise","delay_s":2,"duration_s":6}]}');
+    final json = SceneDirector.specToJson(s);
+    final rt = SceneDirector.parseSpec(jsonEncode(json));
+    expect(rt.sources.single.delayS, 2);
+    expect(rt.sources.single.name, 'breeze');
+  });
+
+  test('drops garbage sound values (derailment guard)', () {
+    final s = SceneDirector.parseSpec('{"sources":['
+        '{"kind":"noise","sound":"]"},'
+        '{"kind":"noise","sound":"42"},'
+        '{"kind":"noise","sound":"campfire crackling"}]}');
+    expect(s.sources[0].sound, isNull); // punctuation-only → procedural
+    expect(s.sources[1].sound, isNull); // digits-only → procedural
+    expect(s.sources[2].sound, 'campfire crackling');
+  });
+
+  test('inferTiming maps "after N" cues onto later sources', () {
+    final s = SceneDirector.parseSpec('{"sources":['
+        '{"name":"rain","kind":"rain"},'
+        '{"name":"breeze","kind":"noise"},'
+        '{"name":"plane","kind":"noise"}]}');
+    SceneDirector.inferTiming(
+      s,
+      "I'm in rain, after 2 seconds a cold breeze, then a plane passes",
+    );
+    expect(s.sources[0].delayS, 0); // bed stays immediate
+    expect(s.sources[1].delayS, 2); // "after 2" → breeze
+    expect(s.sources[2].delayS, 4); // "then" → next staggered cue
+  });
+
+  test('inferTiming is a no-op without timing words or with model cues',
+      () {
+    final quiet = SceneDirector.parseSpec('{"sources":['
+        '{"kind":"rain"},{"kind":"bee"}]}');
+    SceneDirector.inferTiming(quiet, 'rain all around, a bee circling');
+    expect(quiet.sources.every((s) => s.delayS == 0), isTrue);
+
+    final authored = SceneDirector.parseSpec('{"sources":['
+        '{"kind":"rain"},{"kind":"noise","delay_s":7}]}');
+    SceneDirector.inferTiming(authored, 'rain, then after 2 seconds wind');
+    expect(authored.sources[1].delayS, 7); // model's delay_s wins
   });
 }

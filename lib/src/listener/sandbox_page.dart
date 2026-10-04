@@ -24,14 +24,44 @@ class SourceDot {
     required this.pos,
     this.gain = 1.0,
     this.z = 0,
+    this.delayS = 0,
+    this.estDurS = 0,
     String? label,
   }) : label = label ?? kind.name;
-  int id; // re-assigned when the engine restarts (old ids die with it)
+  int? id; // live engine id — null while pending (scheduled, not yet
+  // audible). Re-assigned when the engine restarts (old ids die with it)
   final SourceKindWire kind;
   Offset pos; // (front, left), meters
   double gain;
   double z; // up, meters
   String label; // spec name or kind name — shown on the radar + chips
+
+  /// Authored cue from the spec: seconds after scene start when this
+  /// source becomes audible. estDurS > 0 marks a scene-authored dot
+  /// (manual palette dots have 0 and stay off the master seekbar).
+  double delayS;
+  double estDurS;
+  DateTime? dueAt; // sceneT0 + delayS — set when the dot is pending
+  bool adding = false; // async engine-add in flight — tick re-entry guard
+  bool addFailed = false; // engine add threw — stops tick retries until
+  // a scene seek or engine restart gives it a fresh attempt
+
+  /// Pending: authored dot with no live engine source yet (its cue
+  /// hasn't arrived, or the scene was scrubbed back before it).
+  bool get pending => id == null;
+
+  /// Finished: a one-shot file source the engine already dropped —
+  /// playhead reached the end. The dot stays for master-bar scrubbing
+  /// (seeking back into its window revives it) but is stale in Rust.
+  bool get finished {
+    final dur = fileDurS, t0 = fileT0;
+    if (!isFile || looping || dur == null || t0 == null) return false;
+    return DateTime.now().difference(t0).inMilliseconds >= dur * 1000;
+  }
+
+  /// Needs an engine source: pending, or a finished one-shot sitting
+  /// inside its play window again after a scrub.
+  bool get needsSource => pending || finished;
 
   /// Decoded-clip bytes once SFX generation lands (the procedural `kind`
   /// is only the stand-in). Kept so engine restarts re-add the file
@@ -160,6 +190,7 @@ class _SandboxPageState extends State<SandboxPage> {
       setPos: _directedSetPos,
       upgrade: _directedUpgrade,
       onStatus: _sfxStatus,
+      onSceneStart: _onSceneStart,
     );
     _pose.start();
     _link.start();
@@ -366,6 +397,8 @@ class _SandboxPageState extends State<SandboxPage> {
       final info = await engineStart();
       // Fresh engine has no sources — re-add local dots and linked beacons.
       for (final s in _sources) {
+        if (s.pending) continue; // not due — the ticker realizes it
+        s.addFailed = false;
         if (s.isFile) {
           final info = await addFileSource(
             bytes: s.fileBytes!,
@@ -377,7 +410,18 @@ class _SandboxPageState extends State<SandboxPage> {
           );
           s.id = info.id;
           s.fileDurS = info.durationS;
-          s.fileT0 = DateTime.now(); // playback restarts from 0
+          // Resume at the scene-score position, not from 0.
+          final local = _sceneT - s.delayS;
+          if (s.estDurS > 0 && local > 0 && info.durationS > 0) {
+            final pos = s.looping
+                ? local % info.durationS
+                : local.clamp(0.0, info.durationS);
+            seekSource(id: info.id, posS: pos);
+            s.fileT0 = DateTime.now()
+                .subtract(Duration(milliseconds: (pos * 1000).round()));
+          } else {
+            s.fileT0 = DateTime.now();
+          }
         } else {
           s.id = await addSource(
             kind: s.kind,
@@ -392,6 +436,7 @@ class _SandboxPageState extends State<SandboxPage> {
         await _createBeaconSource(b);
       }
       _director.setMotionPaused(false); // resume orbit ticks (live ids)
+      _director.seekScene(_sceneT); // motion re-anchors to the score
       setState(() {
         _engineOn = true;
         _info = info;
@@ -449,32 +494,76 @@ class _SandboxPageState extends State<SandboxPage> {
     double z,
     double gain, {
     String? label,
+    SpecSource? spec,
   }) async {
     if (!_engineOn) {
       _toast('start the engine first');
       return null;
     }
+    final dot = SourceDot(
+      id: null,
+      kind: kind,
+      pos: pos,
+      gain: gain,
+      z: z,
+      label: label,
+      delayS: spec?.delayS ?? 0,
+      estDurS: spec?.durationS ?? 0,
+    );
+    setState(() => _sources.add(dot));
+    final delay = dot.delayS;
+    if (delay <= 0) {
+      // Immediate cue — add the engine source right away.
+      if (!await _realizeDot(dot)) {
+        setState(() => _sources.remove(dot)); // don't linger as pending
+        return null;
+      }
+    } else {
+      // Scheduled cue — pending dot, no engine source yet. The seek
+      // ticker's _ensurePendingAdds realizes it at sceneT >= delay.
+      dot.dueAt = _sceneT0?.add(
+        Duration(milliseconds: (delay * 1000).round()),
+      );
+      debugPrint('[scene] ${dot.label}: due in ${delay.toStringAsFixed(1)}s');
+      _syncSeekTicker(); // start ticking so the pending add fires
+    }
+    return dot;
+  }
+
+  /// Create the engine source for a dot that has none — procedural or
+  /// file depending on whether the clip has landed. Returns true if a
+  /// live engine id exists afterward.
+  Future<bool> _realizeDot(SourceDot dot) async {
+    if (dot.id != null || dot.adding || !_engineOn) return dot.id != null;
+    dot.adding = true;
     try {
-      final id = await addSource(
-        kind: kind,
-        x: pos.dx,
-        y: pos.dy,
-        z: z,
-        gain: gain,
-      );
-      final dot = SourceDot(
-        id: id,
-        kind: kind,
-        pos: pos,
-        gain: gain,
-        z: z,
-        label: label,
-      );
-      setState(() => _sources.add(dot));
-      return dot;
+      if (dot.isFile) {
+        final info = await addFileSource(
+          bytes: dot.fileBytes!,
+          looping: dot.looping,
+          x: dot.pos.dx,
+          y: dot.pos.dy,
+          z: dot.z,
+          gain: dot.gain,
+        );
+        dot.id = info.id;
+        dot.fileDurS = info.durationS;
+      } else {
+        dot.id = await addSource(
+          kind: dot.kind,
+          x: dot.pos.dx,
+          y: dot.pos.dy,
+          z: dot.z,
+          gain: dot.gain,
+        );
+      }
+      if (mounted) setState(() {});
+      return true;
     } catch (e) {
       _toast('add source failed: $e');
-      return null;
+      return false;
+    } finally {
+      dot.adding = false;
     }
   }
 
@@ -490,9 +579,13 @@ class _SandboxPageState extends State<SandboxPage> {
     dot.fileBytes = bytes;
     dot.looping = looping;
     _syncSeekTicker(); // isFile just flipped — its row should appear
-    if (!_engineOn) return;
+    if (!_engineOn || dot.id == null) {
+      // Pending (or engine off): stash the bytes — _ensurePendingAdds
+      // realizes the dot as a file source directly at its cue.
+      return;
+    }
     try {
-      removeSource(id: dot.id);
+      removeSource(id: dot.id!);
       final info = await addFileSource(
         bytes: bytes,
         looping: looping,
@@ -511,21 +604,138 @@ class _SandboxPageState extends State<SandboxPage> {
     }
   }
 
-  /// One seekbar row per generated clip — a live mini-timeline of every
-  /// file source's playhead (procedural kinds have no timeline to show).
-  /// Ticks while at least one file source exists and the engine runs.
+  /// Scene clock: authored cues (delay_s) on a shared timeline — the
+  /// master seekbar scrubs it, the ticker realizes pending sources at
+  /// their cue and wraps the composition at scene length.
+  DateTime? _sceneT0;
   Timer? _seekTicker;
 
+  /// Per-source clip status for the "compiling audio" prompt status and
+  /// chip spinners — cleared on each scene apply.
+  final _clipStatus = <String, SfxStatus>{};
+  _PromptEntry? _activePrompt; // entry that produced the live scene
+
+  double get _sceneT {
+    final t0 = _sceneT0;
+    if (t0 == null) return 0;
+    return DateTime.now().difference(t0).inMilliseconds / 1000;
+  }
+
+  /// Composition length = latest authored end (delay + clip duration,
+  /// estimated until the real decode lands). 0 = no scene on the clock
+  /// (manual palette dots only).
+  double get _sceneLen => _sources.fold(
+        0.0,
+        (m, d) => d.estDurS > 0
+            ? math.max(m, d.delayS + (d.fileDurS ?? d.estDurS))
+            : m,
+      );
+
+  void _onSceneStart(DateTime t0) {
+    _sceneT0 = t0;
+    _clipStatus.clear();
+  }
+
   void _syncSeekTicker() {
-    if (_engineOn && _sources.any((s) => s.isFile)) {
+    final active =
+        _engineOn && _sources.any((s) => s.isFile || s.needsSource);
+    if (active) {
       _seekTicker ??= Timer.periodic(const Duration(milliseconds: 250), (_) {
-        if (mounted) setState(() {});
+        if (!mounted) return;
+        final len = _sceneLen;
+        if (len > 0 && _sceneT >= len) {
+          _sceneSeek(_sceneT % len); // scene wraps — composition repeats
+        }
+        _ensurePendingAdds();
+        setState(() {});
       });
     } else {
       _seekTicker?.cancel();
       _seekTicker = null;
     }
     if (mounted) setState(() {});
+  }
+
+  /// Realize any pending/finished authored dots whose cue has arrived.
+  void _ensurePendingAdds() {
+    if (!_engineOn) return;
+    final t = _sceneT;
+    for (final dot in _sources) {
+      if (!dot.needsSource || dot.adding || dot.addFailed) continue;
+      final local = t - dot.delayS;
+      if (local < 0) continue;
+      if (dot.finished && dot.id != null) {
+        // A finished one-shot only revives inside its play window.
+        final dur = dot.fileDurS ?? 0;
+        if (dur <= 0 || local >= dur) continue;
+        dot.id = null; // engine already dropped it — id was stale
+      }
+      unawaited(_realizeAt(dot, local));
+    }
+  }
+
+  Future<void> _realizeAt(SourceDot dot, double local) async {
+    final dur = dot.fileDurS;
+    if (dot.isFile && !dot.looping && dur != null && local >= dur) {
+      // Missed cue: the clip landed (or the engine restarted) after its
+      // window fully expired — replay it once rather than stay silent.
+      debugPrint('[scene] ${dot.label}: missed cue — replaying');
+      local = 0;
+    }
+    if (!await _realizeDot(dot)) {
+      dot.addFailed = true;
+      return;
+    }
+    // fileDurS may only exist now — addFileSource just decoded it.
+    final d = dot.fileDurS;
+    if (dot.isFile && dot.id != null && d != null && d > 0) {
+      final pos = dot.looping ? local % d : local.clamp(0.0, d);
+      seekSource(id: dot.id!, posS: pos);
+      dot.fileT0 = DateTime.now()
+          .subtract(Duration(milliseconds: (pos * 1000).round()));
+    } else {
+      dot.fileT0 = DateTime.now();
+    }
+    debugPrint('[scene] ${dot.label}: live at ${local.toStringAsFixed(1)}s');
+  }
+
+  /// Master-bar scrub: re-anchor the scene clock, motion anchors, and
+  /// every authored dot's engine source to the new scene time.
+  void _sceneSeek(double t) {
+    if (_sceneT0 == null) return;
+    _sceneT0 = DateTime.now()
+        .subtract(Duration(milliseconds: (t * 1000).round()));
+    _director.seekScene(t);
+    for (final dot in _sources) {
+      if (dot.estDurS <= 0) continue; // manual sources aren't on the score
+      dot.dueAt = _sceneT0!.add(
+        Duration(milliseconds: (dot.delayS * 1000).round()),
+      );
+      dot.addFailed = false;
+      final local = t - dot.delayS;
+      if (local < 0) {
+        // Before its cue — go silent: drop the engine source, the dot
+        // becomes pending and re-realizes on a forward scrub/tick.
+        if (dot.id != null) {
+          try {
+            removeSource(id: dot.id!);
+          } catch (_) {}
+          dot.id = null;
+        }
+        continue;
+      }
+      if (dot.isFile && dot.id != null && !dot.finished) {
+        final dur = dot.fileDurS ?? 0;
+        if (dur > 0) {
+          final pos = dot.looping ? local % dur : local.clamp(0.0, dur);
+          seekSource(id: dot.id!, posS: pos);
+          dot.fileT0 = DateTime.now()
+              .subtract(Duration(milliseconds: (pos * 1000).round()));
+        }
+      }
+    }
+    _ensurePendingAdds();
+    setState(() {});
   }
 
   /// Estimated playhead position — local clock, wraps for loops,
@@ -539,12 +749,64 @@ class _SandboxPageState extends State<SandboxPage> {
   }
 
   void _seekTo(SourceDot d, double pos) {
-    if (_engineOn) seekSource(id: d.id, posS: pos);
+    if (_engineOn && d.id != null) seekSource(id: d.id!, posS: pos);
     // Re-anchor the local estimate to the new playhead.
     d.fileT0 = DateTime.now().subtract(
       Duration(milliseconds: (pos * 1000).round()),
     );
     setState(() {});
+  }
+
+  /// Master seekbar — one bar for the whole composed scene. Scrubs the
+  /// scene clock: every clip's playhead, pending schedule, and motion
+  /// anchor follows (delay_i), so "breeze at 2s, plane at 4s" replays
+  /// exactly as authored.
+  Widget _sceneRow() {
+    final len = _sceneLen;
+    final t = len > 0 ? _sceneT % len : 0.0;
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
+      child: Row(
+        children: [
+          const SizedBox(
+            width: 60,
+            child: Text(
+              'scene',
+              style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
+            ),
+          ),
+          Expanded(
+            child: SizedBox(
+              height: 24,
+              child: SliderTheme(
+                data: SliderTheme.of(context).copyWith(
+                  trackHeight: 3,
+                  thumbShape: const RoundSliderThumbShape(
+                    enabledThumbRadius: 7,
+                  ),
+                  overlayShape: const RoundSliderOverlayShape(
+                    overlayRadius: 14,
+                  ),
+                ),
+                child: Slider(
+                  value: t.clamp(0.0, len > 0 ? len : 1),
+                  max: len > 0 ? len : 1,
+                  onChanged: _engineOn && len > 0 ? _sceneSeek : null,
+                ),
+              ),
+            ),
+          ),
+          SizedBox(
+            width: 74,
+            child: Text(
+              '${t.toStringAsFixed(1)} / ${len.toStringAsFixed(1)}s',
+              style: const TextStyle(fontSize: 10, color: Color(0xFF9AA4B2)),
+              textAlign: TextAlign.right,
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   Widget _seekRow(SourceDot d) {
@@ -599,16 +861,19 @@ class _SandboxPageState extends State<SandboxPage> {
   }
 
   void _sfxStatus(String name, SfxStatus status) {
+    _clipStatus[name] = status;
     // No per-source toasts — the logs, the landed file chip, and the
-    // auto-opened seekbar already show progress. Failures still toast.
+    // seekbars already show progress. Failures still toast.
     if (status == SfxStatus.failed) {
       _toast('$name: generation failed');
     }
+    if (mounted) setState(() {});
   }
 
   void _directedRemove(Object key) {
     final dot = key as SourceDot;
-    removeSource(id: dot.id);
+    final id = dot.id;
+    if (id != null) removeSource(id: id);
     setState(() => _sources.remove(dot));
     _syncSeekTicker();
   }
@@ -617,9 +882,10 @@ class _SandboxPageState extends State<SandboxPage> {
   // keep working after an engine restart re-assigns ids.
   void _directedSetPos(Object key, Offset pos, double z) {
     final dot = key as SourceDot;
-    if (_engineOn) {
+    final id = dot.id;
+    if (_engineOn && id != null) {
       try {
-        setSourcePosition(id: dot.id, x: pos.dx, y: pos.dy, z: z);
+        setSourcePosition(id: id, x: pos.dx, y: pos.dy, z: z);
       } catch (e) {
         // Engine may have already dropped the source (one-shot finished
         // between ticks) — keep the radar dot moving regardless.
@@ -694,6 +960,7 @@ class _SandboxPageState extends State<SandboxPage> {
       } else {
         entry.specSeconds =
             DateTime.now().difference(entry.startedAt).inMilliseconds / 1000;
+        _activePrompt = entry;
         _promptCtl.clear();
         unawaited(_savePrompts());
       }
@@ -707,6 +974,7 @@ class _SandboxPageState extends State<SandboxPage> {
   Future<void> _replay(_PromptEntry e) async {
     final spec = e.spec;
     if (spec == null) return;
+    _activePrompt = e;
     await _director.apply(spec);
   }
 
@@ -718,16 +986,19 @@ class _SandboxPageState extends State<SandboxPage> {
 
   void _clearAll() {
     for (final s in _sources) {
-      removeSource(id: s.id);
+      final id = s.id;
+      if (id != null) removeSource(id: id);
     }
     _sources.clear();
     _director.reset();
+    _sceneT0 = null;
     _syncSeekTicker();
     setState(() {});
   }
 
   void _removeSource(SourceDot s) {
-    removeSource(id: s.id);
+    final id = s.id;
+    if (id != null) removeSource(id: id);
     setState(() => _sources.remove(s));
     _syncSeekTicker();
   }
@@ -1011,7 +1282,10 @@ class _SandboxPageState extends State<SandboxPage> {
       -(local.dx - center.dx) / scale,
     );
     setState(() => s.pos = scene);
-    setSourcePosition(id: s.id, x: scene.dx, y: scene.dy, z: s.z);
+    final id = s.id;
+    if (id != null) {
+      setSourcePosition(id: id, x: scene.dx, y: scene.dy, z: s.z);
+    }
   }
 
   void _onRadarLongPress(LongPressStartDetails d, Offset center, double scale) {
@@ -1155,9 +1429,17 @@ class _SandboxPageState extends State<SandboxPage> {
                         Text(
                           e.spec == null
                               ? 'Gemma… ${DateTime.now().difference(e.startedAt).inSeconds}s'
-                              : e.specSeconds != null
-                                  ? 'spec in ${e.specSeconds!.toStringAsFixed(0)}s'
-                                  : 'saved',
+                              : e == _activePrompt &&
+                                      _clipStatus.values.any(
+                                        (s) => s == SfxStatus.generating,
+                                      )
+                                  ? 'compiling audio '
+                                      '${_clipStatus.values.where((s) => s != SfxStatus.generating).length}'
+                                      '/${_clipStatus.length}…'
+                                  : e.specSeconds != null
+                                      ? 'spec in ${e.specSeconds!.toStringAsFixed(0)}s'
+                                          '${e == _activePrompt && _clipStatus.isNotEmpty ? ' · audio ready' : ''}'
+                                      : 'saved',
                           style: const TextStyle(
                             fontSize: 10,
                             color: Color(0xFF9AA4B2),
@@ -1168,6 +1450,7 @@ class _SandboxPageState extends State<SandboxPage> {
                   ),
               ],
             ),
+          if (_sceneLen > 0) _sceneRow(),
           for (final s in _sources.where((d) => d.isFile)) _seekRow(s),
           _sectionLabel('Scenes:'),
           const SizedBox(height: 6),
@@ -1197,15 +1480,32 @@ class _SandboxPageState extends State<SandboxPage> {
                 for (final s in _sources)
                   InputChip(
                     label: Text(
-                      s.label,
+                      s.pending && s.dueAt != null
+                          ? '${s.label} · in ${math.max(0, (s.delayS - _sceneT).ceil())}s'
+                          : s.label,
                       style: TextStyle(
                         fontSize: 12,
-                        color: _kindColors[s.kind] ?? Colors.white,
+                        color: s.pending
+                            ? (_kindColors[s.kind] ?? Colors.white)
+                                .withValues(alpha: 0.45)
+                            : _kindColors[s.kind] ?? Colors.white,
                       ),
                     ),
-                    avatar: s.isFile
-                        ? const Icon(Icons.audio_file, size: 14)
-                        : null,
+                    avatar: switch (_clipStatus[s.label]) {
+                      SfxStatus.failed => const Icon(
+                          Icons.error_outline,
+                          size: 14,
+                          color: Color(0xFFE57373),
+                        ),
+                      SfxStatus.generating => const SizedBox(
+                          width: 12,
+                          height: 12,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                      _ => s.isFile
+                          ? const Icon(Icons.audio_file, size: 14)
+                          : null,
+                    },
                     deleteIcon: const Icon(Icons.close, size: 16),
                     onDeleted: () => _removeSource(s),
                     visualDensity: VisualDensity.compact,
@@ -1424,12 +1724,19 @@ class _RadarPainter extends CustomPainter {
       }
       final p = center + v;
       final color = _kindColors[s.kind] ?? Colors.white;
-      canvas.drawCircle(p, 10, Paint()..color = color.withValues(alpha: 0.25));
-      canvas.drawCircle(p, 6, Paint()..color = color);
+      // Pending sources (authored cue hasn't arrived) paint dimmed —
+      // the composed plan is visible before it sounds.
+      final a = s.pending ? 0.35 : 1.0;
+      canvas.drawCircle(
+        p,
+        10,
+        Paint()..color = color.withValues(alpha: 0.25 * a),
+      );
+      canvas.drawCircle(p, 6, Paint()..color = color.withValues(alpha: a));
       final tp = TextPainter(
         text: TextSpan(
           text: s.label,
-          style: TextStyle(fontSize: 9, color: color),
+          style: TextStyle(fontSize: 9, color: color.withValues(alpha: a)),
         ),
         textDirection: TextDirection.ltr,
       )..layout();

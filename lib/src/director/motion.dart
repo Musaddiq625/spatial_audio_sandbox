@@ -39,9 +39,26 @@ class MotionBank {
   /// Restart a source's motion clock — e.g. its generated clip just
   /// landed, so a traverse should sweep from the start now, not from the
   /// moment the spec was applied.
-  void restart(Object key) {
+  void restart(Object key) => restartAt(key, DateTime.now());
+
+  /// Restart anchored at an explicit instant — a delayed source whose
+  /// clip landed early anchors to its scheduled cue, not land time.
+  void restartAt(Object key, DateTime t0) {
     for (final e in _entries) {
-      if (e.key == key) e.t0 = DateTime.now();
+      if (e.key == key) e.t0 = t0;
+    }
+  }
+
+  /// Re-anchor every tracked source to [sceneT] on the scene clock —
+  /// a master seekbar scrub or an engine restart resume. t0 shifts so
+  /// (now - t0) == sceneT - delay_s, i.e. motion follows the score.
+  void seekTo(double sceneT) {
+    final now = DateTime.now();
+    for (final e in _entries) {
+      final local = sceneT - e.spec.delayS;
+      e.t0 = now.subtract(
+        Duration(milliseconds: (local * 1000).round()),
+      );
     }
   }
 
