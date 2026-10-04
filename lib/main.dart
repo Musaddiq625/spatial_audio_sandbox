@@ -3,7 +3,7 @@ import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:spatial_audio_sandbox/src/rust/frb_generated.dart';
-import 'package:spatial_audio_sandbox/src/listener/sandbox_page.dart';
+import 'package:spatial_audio_sandbox/src/bootstrap/intro_splash.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -31,7 +31,7 @@ class SandboxApp extends StatelessWidget {
       theme: ThemeData.dark(useMaterial3: true).copyWith(
         scaffoldBackgroundColor: const Color(0xFF0B0E14),
       ),
-      home: const SandboxPage(),
+      home: const IntroSplashPage(),
     );
   }
 }

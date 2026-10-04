@@ -1461,7 +1461,7 @@ class _SandboxPageState extends State<SandboxPage> {
         child: Padding(
           padding: EdgeInsets.only(top: 2, bottom: 4),
           child: Text(
-            'Built with ❤️\nby Musaddiq625',
+            'Built with ❤️ by Musaddiq625',
             textAlign: TextAlign.center,
             style: TextStyle(
               fontSize: 10,
