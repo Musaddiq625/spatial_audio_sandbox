@@ -128,4 +128,10 @@ impl Engine {
     pub fn set_spatial_width(&mut self, w: f32) {
         let _ = self.push(Cmd::SetWidth { w });
     }
+
+    /// Live spatial tuning for the calibration panel: azimuth
+    /// exaggeration, reverb wet send, extra far-ear cut span (dB).
+    pub fn set_spatial_params(&mut self, width: f32, wet: f32, ild_db: f32) {
+        let _ = self.push(Cmd::SetSpatial { width, wet, ild_db });
+    }
 }

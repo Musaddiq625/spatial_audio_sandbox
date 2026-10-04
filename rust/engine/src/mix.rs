@@ -22,6 +22,9 @@ pub enum Cmd {
     /// L/R exaggeration: scales the azimuth used for HRIR lookup and
     /// adds a contralateral-ear level cut. 1.0 = natural.
     SetWidth { w: f32 },
+    /// Live spatial tuning from the calibration panel: azimuth
+    /// exaggeration, reverb send, and the far-ear cut span in dB.
+    SetSpatial { width: f32, wet: f32, ild_db: f32 },
     Seek { id: u32, pos_s: f32 },
     SetMaster { gain: f32 },
     SetWet { wet: f32 },
@@ -129,6 +132,9 @@ pub struct Mixer {
     master: f32,
     /// Lateral exaggeration (>1 widens the stereo image's L/R cue).
     width: f32,
+    /// Extra contralateral cut at full lateral, in dB — applied on top
+    /// of the baked-in head shadow as (width-1)*ild_db*sin|az|.
+    ild_db: f32,
     pub frames_rendered: u64,
 }
 
@@ -158,9 +164,10 @@ impl Mixer {
                 scratch: vec![0.0; MAX_BLOCK],
                 verb_l,
                 verb_r,
-                wet: 0.12,
+                wet: 0.08,
                 master: 0.9,
                 width: 1.3,
+                ild_db: 10.0,
                 frames_rendered: 0,
             },
             tx,
@@ -228,6 +235,11 @@ impl Mixer {
             }
             Cmd::SetWidth { w } => {
                 self.width = w.clamp(0.4, 2.0);
+            }
+            Cmd::SetSpatial { width, wet, ild_db } => {
+                self.width = width.clamp(0.4, 2.0);
+                self.wet = wet.clamp(0.0, 0.6);
+                self.ild_db = ild_db.clamp(0.0, 24.0);
             }
             Cmd::Seek { id, pos_s } => {
                 if let Some(s) = self.sources.iter_mut().find(|s| s.id == id) {
@@ -332,7 +344,7 @@ impl Mixer {
             // head shadow — this is the cue the ear uses most for L vs
             // R. Never boosts the far ear (width < 1 still narrows via
             // the azimuth scale above).
-            let ild_db = ((self.width - 1.0) * 10.0 * sph.az.abs().sin()).max(0.0);
+            let ild_db = ((self.width - 1.0) * self.ild_db * sph.az.abs().sin()).max(0.0);
             let far_cut = 10f32.powf(-ild_db / 20.0);
             let (gl, gr) = if az_e >= 0.0 { (1.0, far_cut) } else { (far_cut, 1.0) };
             for i in 0..n {

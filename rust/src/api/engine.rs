@@ -226,6 +226,17 @@ pub fn set_spatial_width(w: f32) {
     }
 }
 
+/// Live spatial tuning for the calibration panel: azimuth exaggeration
+/// (0.4-2.0), reverb wet send (0-0.6), extra far-ear cut span (dB).
+#[flutter_rust_bridge::frb(sync)]
+pub fn set_spatial_params(width: f32, wet: f32, ild_db: f32) {
+    if let Ok(mut st) = state().lock() {
+        if let Some(e) = st.engine.as_mut() {
+            e.set_spatial_params(width, wet, ild_db);
+        }
+    }
+}
+
 /// Restrict head tracking to yaw (heading about gravity): tilts and
 /// in-hand rolls stop swinging the scene's azimuth. Toggleable live.
 #[flutter_rust_bridge::frb(sync)]

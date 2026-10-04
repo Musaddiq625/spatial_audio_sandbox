@@ -78,6 +78,19 @@ impl SyntheticHrirSet {
         (-2.0 * PI * fc / sr).exp()
     }
 
+    /// Two-band head-shadow shelf: frequencies below `fc` pass at ~0 dB
+    /// (sound diffracts around the head), above `fc` attenuated to
+    /// `hf_gain`. A one-pole split keeps the transition gentle.
+    fn shelf_filter(ir: &mut [f32], fc: f32, hf_gain: f32, sr: f32) {
+        let a = Self::lp_a(fc, sr);
+        let mut y1 = 0.0f32;
+        for x in ir.iter_mut() {
+            let lo = (1.0 - a) * *x + a * y1;
+            y1 = lo;
+            *x = lo + (*x - lo) * hf_gain;
+        }
+    }
+
     /// Apply one-pole LP in place: y[n] = (1-a)x[n] + a*y[n-1].
     fn lp_filter(ir: &mut [f32], fc: f32, sr: f32) {
         let a = Self::lp_a(fc, sr);
@@ -125,26 +138,38 @@ impl SyntheticHrirSet {
 
     fn synthesize(sr: f32, az_deg: f32, el_deg: f32) -> Hrir {
         let abs_az = az_deg.abs();
-        // Shadow factor: 0 in front, 1 fully lateral/rear.
-        let shadow = (abs_az.min(90.0) / 90.0).clamp(0.0, 1.0);
+        // Lateral factor on a sin curve — the old linear |az|/90 ramp
+        // gave only ~2.5 dB at 45 deg; a real head is ~7-8 dB there.
+        // sin grows faster at mid angles: ~3.5 dB@20, ~8 dB@45, ~12 dB@90.
+        let s = (abs_az.min(90.0).to_radians()).sin();
         // Rear factor: 0 in front hemisphere, 1 directly behind.
         let rear = ((abs_az - 90.0) / 90.0).clamp(0.0, 1.0);
 
         let itd_samp = Self::itd_secs(abs_az) * sr;
-        let fc_far = (20_000.0 * (1.0 - shadow) + 3_500.0 * shadow) * (1.0 - 0.25 * rear);
-        let g_far = 10f32.powf(-(5.0 * shadow + 1.5 * rear) / 20.0);
+        // Broadband level difference: ~12 dB max, weighted by the sin
+        // curve, plus a small rear penalty. Near ear gets a hair of
+        // lift — physical heads gain ~1 dB ipsilaterally at lateral.
+        let g_far = 10f32.powf(-(11.0 * s + 1.5 * rear) / 20.0);
+        let g_near = 10f32.powf((1.2 * s) / 20.0);
+        // Frequency-dependent shadow (Brown-Duda style): LF diffracts
+        // around the head nearly unimpeded; HF is shelved off. The
+        // shelf deepens with angle — at az=0 it must be transparent or
+        // front symmetry breaks.
+        let fc_sh = 1_600.0 + 2_400.0 * (1.0 - s); // 1.6kHz lateral .. 4kHz frontal
+        let hf_g = 10f32.powf(-14.0 * s / 20.0); // 0 dB front .. -14 dB lateral
         // Rear sources sound duller on BOTH ears (pinna front/back cue).
         let fc_dull = 20_000.0 - 13_000.0 * rear;
 
         let taps = Self::pinna_taps(el_deg);
 
         let mut near = [0f32; HRIR_LEN];
-        Self::place_delayed(&mut near, &taps, 0.0, 1.0);
+        Self::place_delayed(&mut near, &taps, 0.0, g_near);
         Self::lp_filter(&mut near, fc_dull, sr);
 
         let mut far = [0f32; HRIR_LEN];
         Self::place_delayed(&mut far, &taps, itd_samp, g_far);
-        Self::lp_filter(&mut far, fc_far.min(fc_dull), sr);
+        Self::shelf_filter(&mut far, fc_sh.min(fc_dull), hf_g, sr);
+        Self::lp_filter(&mut far, fc_dull, sr);
 
         // az > 0 => source on the left => left ear is near.
         let (left, right) = if az_deg >= 0.0 { (near, far) } else { (far, near) };
@@ -201,6 +226,34 @@ mod tests {
         for i in 0..HRIR_LEN {
             assert!((h.left[i] - h.right[i]).abs() < 1e-6, "front HRIR not symmetric at {i}");
         }
+    }
+
+    /// Broadband level difference between ears in dB for a given az.
+    fn ild_db(set: &SyntheticHrirSet, az_deg: f32) -> f32 {
+        let h = set.hrir(az_deg.to_radians(), 0.0);
+        let near = energy(&h.left).max(energy(&h.right));
+        let far = energy(&h.left).min(energy(&h.right));
+        10.0 * (near / far).log10()
+    }
+
+    /// The fix for "can't tell left from right until it's lateral":
+    /// ILD must grow steeply through the 20-60 deg band, not only
+    /// near 90 deg. Targets approximate a real head above ~2 kHz.
+    #[test]
+    fn ild_grows_fast_enough_at_mid_angles() {
+        let set = SyntheticHrirSet::new(48_000.0);
+        let i20 = ild_db(&set, 20.0);
+        let i30 = ild_db(&set, 30.0);
+        let i45 = ild_db(&set, 45.0);
+        let i90 = ild_db(&set, 90.0);
+        // Monotonic growth.
+        assert!(i20 < i30 && i30 < i45 && i45 < i90,
+            "ILD not monotonic: {i20} {i30} {i45} {i90}");
+        // The old linear model gave ~2.5 dB at 45 deg — demand clearly
+        // more through the band where users were guessing.
+        assert!(i30 > 4.0, "30 deg ILD too weak: {i30} dB");
+        assert!(i45 > 6.5, "45 deg ILD too weak: {i45} dB");
+        assert!(i90 > 10.0, "90 deg ILD too weak: {i90} dB");
     }
 
     #[test]

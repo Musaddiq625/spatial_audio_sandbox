@@ -52,6 +52,18 @@ void setPredictMs({required double ms}) =>
 void setSpatialWidth({required double w}) =>
     RustLib.instance.api.crateApiEngineSetSpatialWidth(w: w);
 
+/// Live spatial tuning for the calibration panel: azimuth exaggeration
+/// (0.4-2.0), reverb wet send (0-0.6), extra far-ear cut span (dB).
+void setSpatialParams({
+  required double width,
+  required double wet,
+  required double ildDb,
+}) => RustLib.instance.api.crateApiEngineSetSpatialParams(
+  width: width,
+  wet: wet,
+  ildDb: ildDb,
+);
+
 /// Restrict head tracking to yaw (heading about gravity): tilts and
 /// in-hand rolls stop swinging the scene's azimuth. Toggleable live.
 void setYawOnly({required bool yawOnly}) =>

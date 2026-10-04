@@ -10,6 +10,7 @@ import 'package:spatial_audio_sandbox/src/director/scene_director.dart';
 import 'package:spatial_audio_sandbox/src/director/sfx_client.dart';
 import 'package:spatial_audio_sandbox/src/link/acoustic_bridge.dart';
 import 'package:spatial_audio_sandbox/src/listener/beacon_tracker.dart';
+import 'package:spatial_audio_sandbox/src/listener/calibration_sheet.dart';
 import 'package:spatial_audio_sandbox/src/link/link.dart';
 import 'package:spatial_audio_sandbox/src/link/net_state.dart';
 import 'package:spatial_audio_sandbox/src/listener/pose_channel.dart';
@@ -181,7 +182,16 @@ class _SandboxPageState extends State<SandboxPage> {
   double _virtualYaw = 0; // radians, desktop fallback
   double _yawAtRecenter = 0;
   bool _yawOnly = false; // head tracking mode: false = full 3D
-  double _width = 1.3; // L/R separation exaggeration (matches Rust default)
+  // Spatial tuning — must match the Rust mixer defaults.
+  double _width = 1.3; // L/R separation exaggeration
+  double _wet = 0.08; // reverb send
+  double _ildDb = 10.0; // extra far-ear cut span at full lateral
+
+  void _sendSpatial() {
+    if (_engineOn) {
+      setSpatialParams(width: _width, wet: _wet, ildDb: _ildDb);
+    }
+  }
   int _nextPaletteIdx = 0;
   Timer? _statsTimer;
   final _promptCtl = TextEditingController();
@@ -424,7 +434,7 @@ class _SandboxPageState extends State<SandboxPage> {
       final info = await engineStart();
       _applyRecenter(); // engine start = "forward is where I face now"
       // A fresh Mixer forgets tuning — re-send user prefs.
-      setSpatialWidth(w: _width);
+      setSpatialParams(width: _width, wet: _wet, ildDb: _ildDb);
       setYawOnly(yawOnly: _yawOnly);
       // Fresh engine has no sources — re-add local dots and linked beacons.
       for (final s in _sources) {
@@ -1307,6 +1317,28 @@ class _SandboxPageState extends State<SandboxPage> {
         ),
         actions: [
           IconButton(
+            tooltip: 'ear calibration (L/R test)',
+            onPressed: () => showModalBottomSheet(
+              context: context,
+              isScrollControlled: true,
+              builder: (_) => CalibrationSheet(
+                pose: _pose,
+                engineOn: _engineOn,
+                width: _width,
+                wet: _wet,
+                ildDb: _ildDb,
+                onSpatial: (w, wt, ild) => setState(() {
+                  _width = w;
+                  _wet = wt;
+                  _ildDb = ild;
+                  _sendSpatial();
+                }),
+                onStartEngine: _startEngine,
+              ),
+            ),
+            icon: const Icon(Icons.hearing, size: 20),
+          ),
+          IconButton(
             tooltip: _yawOnly
                 ? 'head tracking: yaw only (tap for full 3D)'
                 : 'head tracking: full 3D (tap for yaw only)',
@@ -1936,7 +1968,7 @@ class _SandboxPageState extends State<SandboxPage> {
                   label: 'L/R ×${_width.toStringAsFixed(1)}',
                   onChanged: (v) {
                     setState(() => _width = v);
-                    setSpatialWidth(w: v);
+                    _sendSpatial();
                   },
                 ),
               ),
