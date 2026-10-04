@@ -158,6 +158,9 @@ pub struct DiagStatus {
     session: AtomicU32,
     trial: AtomicU32,
     remaining_ms: AtomicU32,
+    /// Live output levels for the radar HUD — same read cadence, same
+    /// lock-free discipline.
+    pub meters: Meters,
 }
 
 impl DiagStatus {
@@ -173,6 +176,57 @@ impl DiagStatus {
         self.session.store(session, Ordering::Relaxed);
         self.trial.store(trial, Ordering::Relaxed);
         self.remaining_ms.store(remaining_ms, Ordering::Relaxed);
+    }
+}
+
+/// Realtime level telemetry for the UI. Written per block on the audio
+/// thread (a few multiplies per sample, no allocation), read at ~30 Hz.
+/// Per-source slots pack (id << 32) | rms_bits so id and level never
+/// tear apart under a racing read.
+#[derive(Default)]
+pub struct Meters {
+    /// Master bus block-RMS (post master gain + soft clip), f32 bits.
+    left: AtomicU32,
+    right: AtomicU32,
+    slots: [std::sync::atomic::AtomicU64; MAX_SOURCES],
+}
+
+impl Meters {
+    fn write_master(&self, l: f32, r: f32) {
+        self.left.store(l.to_bits(), Ordering::Relaxed);
+        self.right.store(r.to_bits(), Ordering::Relaxed);
+    }
+
+    fn write_slot(&self, i: usize, id: u32, rms: f32) {
+        self.slots[i].store(
+            ((id as u64) << 32) | rms.to_bits() as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Zero slots past the live source count — a removed source stops
+    /// reporting instead of freezing at its last level.
+    fn clear_from(&self, i: usize) {
+        for s in &self.slots[i..] {
+            s.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Snapshot for the UI. Allocates — call at UI cadence only.
+    pub fn read(&self) -> (f32, f32, Vec<(u32, f32)>) {
+        let mut v = Vec::new();
+        for s in &self.slots {
+            let p = s.load(Ordering::Relaxed);
+            let id = (p >> 32) as u32;
+            if id != 0 {
+                v.push((id, f32::from_bits(p as u32)));
+            }
+        }
+        (
+            f32::from_bits(self.left.load(Ordering::Relaxed)),
+            f32::from_bits(self.right.load(Ordering::Relaxed)),
+            v,
+        )
     }
 }
 
@@ -455,7 +509,7 @@ impl Mixer {
         let render_normal = !session_hold || self.norm_fade > 0.0;
 
         if render_normal {
-            for s in self.sources.iter_mut() {
+            for (si, s) in self.sources.iter_mut().enumerate() {
             // Finished one-shots and Remove'd sources fade through the
             // convolver tail instead of hard-cutting — then retire.
             if s.gen.is_finished() || s.removing {
@@ -505,6 +559,7 @@ impl Mixer {
                 for _ in 0..n {
                     s.gen.tick(self.sr);
                 }
+                self.status.meters.write_slot(si, s.id, 0.0);
                 continue;
             }
 
@@ -512,10 +567,14 @@ impl Mixer {
             // click-free fades/mutes.
             let slew = 1.0 - (-1.0f32 / (self.sr * 0.02)).exp();
             // n <= scratch.len() is guaranteed by the chunking in process().
+            let mut e = 0.0f32;
             for i in 0..n {
                 s.gain += (s.gain_target - s.gain) * slew;
-                self.scratch[i] = s.dist_lp.tick(s.gen.tick(self.sr)) * s.gain * dg;
+                let x = s.dist_lp.tick(s.gen.tick(self.sr)) * s.gain * dg;
+                self.scratch[i] = x;
+                e += x * x;
             }
+            self.status.meters.write_slot(si, s.id, (e / n as f32).sqrt());
             // Extra interaural level difference on top of the baked-in
             // head shadow — this is the cue the ear uses most for L vs
             // R. Never boosts the far ear (width < 1 still narrows via
@@ -530,6 +589,9 @@ impl Mixer {
             }
             }
         }
+        // Sources beyond the live count (retired this block) report 0 —
+        // a stale id must not ghost a level onto another source's dot.
+        self.status.meters.clear_from(self.sources.len());
 
         // Session gate ramp on what the normals produced (runs before
         // diag renders, so it never scales the test signal).
@@ -622,11 +684,23 @@ impl Mixer {
             self.trash_or_park(Trash::Diag(d));
         }
 
-        // Master gain + soft clip.
+        // Master gain + soft clip, then publish block RMS for the HUD
+        // meters — measured post-clip so the bars show what the user
+        // actually hears.
         let m = self.master;
-        for x in out.iter_mut() {
-            *x = (*x * m).tanh();
+        let mut el = 0.0f32;
+        let mut er = 0.0f32;
+        for i in 0..n {
+            let l = (out[2 * i] * m).tanh();
+            let r = (out[2 * i + 1] * m).tanh();
+            out[2 * i] = l;
+            out[2 * i + 1] = r;
+            el += l * l;
+            er += r * r;
         }
+        self.status
+            .meters
+            .write_master((el / n as f32).sqrt(), (er / n as f32).sqrt());
         self.frames_rendered += n as u64;
     }
 }
@@ -1102,6 +1176,62 @@ mod tests {
         let (_s, trial, rem) = status.read();
         assert_eq!(trial, 0, "finished trial still reported playing");
         assert_eq!(rem, 0);
+    }
+
+    // ── Level telemetry ────────────────────────────────────────────
+
+    /// A left source reports in its slot and tips the master L meter;
+    /// removal clears the slot so stale ids can't ghost a level.
+    #[test]
+    fn meters_follow_source_side() {
+        let (mut mix, _slot, mut tx, _trash, status) = standalone(SAMPLE_RATE);
+        tx.push(Cmd::SetWet { wet: 0.0 }).unwrap();
+        tx.push(Cmd::add(
+            1,
+            source::make(SourceKind::Noise),
+            Vec3::new(0.0, 1.0, 0.0), // hard left
+            1.0,
+            SAMPLE_RATE,
+        ))
+        .unwrap();
+        let mut buf = [0f32; 19200];
+        mix.process(&mut buf);
+        let (l, r, srcs) = status.meters.read();
+        assert!(l > r * 1.5, "left source should tip master L: {l} vs {r}");
+        let slot = srcs.iter().find(|(id, _)| *id == 1);
+        assert!(slot.is_some(), "source 1 missing from level slots");
+        assert!(slot.unwrap().1 > 0.01);
+
+        tx.push(Cmd::Remove { id: 1 }).unwrap();
+        let mut buf = [0f32; 19200];
+        mix.process(&mut buf);
+        let (_, _, srcs) = status.meters.read();
+        assert!(
+            srcs.iter().all(|(id, v)| *id != 1 || *v < 0.01),
+            "removed source still reporting level: {srcs:?}"
+        );
+    }
+
+    /// Direct-mode diagnostic tones bypass the HRTF — a left-ear test
+    /// must move only the L meter (the bars double as a wiring check).
+    #[test]
+    fn diag_direct_meter_is_left_only() {
+        let (mut mix, _slot, mut tx, _trash, status) = standalone(SAMPLE_RATE);
+        tx.push(Cmd::diag_enter(21, SAMPLE_RATE)).unwrap();
+        tx.push(Cmd::DiagPlay {
+            token: 21,
+            trial: 1,
+            direct: true,
+            az: 0.0,
+            level: 1.0,
+            balance: -1.0,
+        })
+        .unwrap();
+        let mut buf = [0f32; 9600];
+        mix.process(&mut buf);
+        let (l, r, _) = status.meters.read();
+        assert!(l > 0.05, "direct-left chime should light L meter: {l}");
+        assert_eq!(r, 0.0, "direct-left leaked into R meter");
     }
 
     fn peak_positions(buf: &[f32]) -> (usize, usize) {

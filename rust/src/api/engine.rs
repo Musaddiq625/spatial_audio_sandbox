@@ -3,6 +3,7 @@
 
 use anyhow::{anyhow, Result};
 use sas_engine::math::Vec3;
+use sas_engine::mix::DiagStatus;
 use sas_engine::pose::{PoseSlot, PoseTracker};
 use sas_engine::rt::{Engine, EngineInfo};
 use sas_engine::source::{FileSource, SourceKind};
@@ -76,6 +77,15 @@ static STATE: OnceLock<Mutex<State>> = OnceLock::new();
 /// clip decode on the state mutex.
 static POSE_SLOT: OnceLock<Arc<PoseSlot>> = OnceLock::new();
 static TRACKER: OnceLock<Mutex<PoseTracker>> = OnceLock::new();
+
+/// The live engine's telemetry handle — held separately from `state()`
+/// so `get_levels` never queues behind the decode/add paths that hold
+/// the engine mutex.
+static STATUS: OnceLock<Mutex<Option<Arc<DiagStatus>>>> = OnceLock::new();
+
+fn status_slot() -> &'static Mutex<Option<Arc<DiagStatus>>> {
+    STATUS.get_or_init(|| Mutex::new(None))
+}
 
 fn pose_slot() -> Arc<PoseSlot> {
     POSE_SLOT.get_or_init(|| Arc::new(PoseSlot::new())).clone()
@@ -166,6 +176,9 @@ pub fn engine_start() -> Result<EngineInfoWire> {
         return Ok(info);
     }
     let engine = Engine::start(pose_slot()).map_err(|e| anyhow!(e))?;
+    if let Ok(mut h) = status_slot().lock() {
+        *h = Some(engine.status_handle());
+    }
     let info = engine.info.clone().into();
     st.engine = Some(engine);
     Ok(info)
@@ -174,6 +187,9 @@ pub fn engine_start() -> Result<EngineInfoWire> {
 pub fn engine_stop() {
     if let Ok(mut st) = state().lock() {
         st.engine = None; // drop stops the stream
+    }
+    if let Ok(mut h) = status_slot().lock() {
+        *h = None;
     }
 }
 
@@ -341,6 +357,35 @@ pub fn diag_status() -> DiagStatusWire {
         .and_then(|mut st| st.engine.as_mut().map(|e| e.diag_status()))
         .unwrap_or((0, 0, 0));
     DiagStatusWire { session, trial, remaining_ms }
+}
+
+/// Stereo + per-source block levels for the radar HUD.
+pub struct LevelsWire {
+    /// Master bus RMS, post master gain + soft clip — what the user
+    /// actually hears.
+    pub left: f32,
+    pub right: f32,
+    /// Parallel lists: engine source id → block RMS.
+    pub source_ids: Vec<u32>,
+    pub source_levels: Vec<f32>,
+}
+
+/// Poll at UI cadence (~30 Hz). Lock-free: reads the mixer's atomics
+/// through the shared status handle — never touches the engine mutex
+/// (the decode/add paths can hold it for a whole clip decode).
+#[flutter_rust_bridge::frb(sync)]
+pub fn get_levels() -> LevelsWire {
+    let handle = status_slot().lock().ok().and_then(|h| h.clone());
+    let (l, r, srcs) = match handle {
+        Some(s) => s.meters.read(),
+        None => (0.0, 0.0, Vec::new()),
+    };
+    LevelsWire {
+        left: l,
+        right: r,
+        source_ids: srcs.iter().map(|(id, _)| *id).collect(),
+        source_levels: srcs.iter().map(|(_, v)| *v).collect(),
+    }
 }
 
 pub fn add_source(kind: SourceKindWire, x: f32, y: f32, z: f32, gain: f32) -> Result<u32> {

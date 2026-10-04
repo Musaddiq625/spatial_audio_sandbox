@@ -178,4 +178,11 @@ impl Engine {
     pub fn diag_status(&self) -> (u32, u32, u32) {
         self.diag_status.read()
     }
+
+    /// Shared audio→UI telemetry handle — lets the levels poll read the
+    /// mixer's atomics without taking the engine mutex (which the
+    /// decode/add paths hold).
+    pub fn status_handle(&self) -> Arc<DiagStatus> {
+        self.diag_status.clone()
+    }
 }

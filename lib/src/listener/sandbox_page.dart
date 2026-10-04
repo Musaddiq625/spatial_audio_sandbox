@@ -426,6 +426,10 @@ class _SandboxPageState extends State<SandboxPage> {
     _scrubbing = false; // drop any in-flight scrub commit
     _scrubT = null;
     _pausedT = null;
+    _levelsTimer?.cancel();
+    _levelsTimer = null;
+    _levels.decay(); // meters settle to silence, no frozen bars
+    _radarTick.value++;
     if (clearScene) _clearAll(); // remove pushes flush while engine lives
     await engineStop();
     // The engine dropped every source — ids are now stale.
@@ -499,6 +503,13 @@ class _SandboxPageState extends State<SandboxPage> {
       setState(() {
         _engineOn = true;
         _info = info;
+      });
+      // ~30 Hz level poll: reads the mixer's atomics (never the engine
+      // mutex) and repaints just the radar.
+      _levelsTimer ??= Timer.periodic(const Duration(milliseconds: 33), (_) {
+        final w = getLevels();
+        _levels.update(w.left, w.right, w.sourceIds, w.sourceLevels);
+        _radarTick.value++;
       });
       _syncSeekTicker(); // file sources re-added — playheads ticking again
     } catch (e) {

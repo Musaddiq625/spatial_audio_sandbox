@@ -6,7 +6,7 @@
 import '../frb_generated.dart';
 import 'package:flutter_rust_bridge/flutter_rust_bridge_for_generated.dart';
 
-// These functions are ignored because they are not marked as `pub`: `clip_cache`, `clip_key`, `decode_to_mono`, `get_or_decode`, `normalize_peak`, `pose_slot`, `resample_linear`, `state`, `tracker`
+// These functions are ignored because they are not marked as `pub`: `clip_cache`, `clip_key`, `decode_to_mono`, `get_or_decode`, `normalize_peak`, `pose_slot`, `resample_linear`, `state`, `status_slot`, `tracker`
 // These types are ignored because they are neither used by any `pub` functions nor (for structs and enums) marked `#[frb(unignore)]`: `ClipCache`, `State`
 // These function are ignored because they are on traits that is not defined in current crate (put an empty `#[frb]` on it to unignore): `clone`, `fmt`, `from`, `from`
 
@@ -115,6 +115,11 @@ void diagParams({
 
 /// Poll at UI cadence — never per-frame.
 DiagStatusWire diagStatus() => RustLib.instance.api.crateApiEngineDiagStatus();
+
+/// Poll at UI cadence (~30 Hz). Lock-free: reads the mixer's atomics
+/// through the shared status handle — never touches the engine mutex
+/// (the decode/add paths can hold it for a whole clip decode).
+LevelsWire getLevels() => RustLib.instance.api.crateApiEngineGetLevels();
 
 Future<int> addSource({
   required SourceKindWire kind,
@@ -319,6 +324,42 @@ class FileSourceInfo {
           runtimeType == other.runtimeType &&
           id == other.id &&
           durationS == other.durationS;
+}
+
+/// Stereo + per-source block levels for the radar HUD.
+class LevelsWire {
+  /// Master bus RMS, post master gain + soft clip — what the user
+  /// actually hears.
+  final double left;
+  final double right;
+
+  /// Parallel lists: engine source id → block RMS.
+  final Uint32List sourceIds;
+  final Float32List sourceLevels;
+
+  const LevelsWire({
+    required this.left,
+    required this.right,
+    required this.sourceIds,
+    required this.sourceLevels,
+  });
+
+  @override
+  int get hashCode =>
+      left.hashCode ^
+      right.hashCode ^
+      sourceIds.hashCode ^
+      sourceLevels.hashCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is LevelsWire &&
+          runtimeType == other.runtimeType &&
+          left == other.left &&
+          right == other.right &&
+          sourceIds == other.sourceIds &&
+          sourceLevels == other.sourceLevels;
 }
 
 /// FRB-friendly mirror of SourceKind.
