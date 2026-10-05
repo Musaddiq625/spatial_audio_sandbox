@@ -19,7 +19,7 @@ class IntroSplashPage extends StatefulWidget {
 
 class _IntroSplashPageState extends State<IntroSplashPage>
     with SingleTickerProviderStateMixin {
-  static const _holdMs = 2600;
+  static const _holdMs = 3000;
   late final AnimationController _ctl;
   Timer? _advanceTimer;
   bool _gone = false;
@@ -60,130 +60,135 @@ class _IntroSplashPageState extends State<IntroSplashPage>
     return GestureDetector(
       onTap: _go,
       child: Scaffold(
-        body: AnimatedBuilder(
-          animation: _ctl,
-          builder: (context, _) {
-            return Column(
-              crossAxisAlignment: CrossAxisAlignment.center,
-              children: [
-                const Spacer(flex: 3),
-                // Radar mark + expanding rings — the "sound around you"
-                // cue. Rings bloom once over the 1900ms controller.
-                SizedBox(
-                  width: 260,
-                  height: 260,
-                  child: CustomPaint(
-                    painter: _PulsePainter(_ctl.value),
-                    child: Center(
-                      child: Transform.scale(
-                        scale: Curves.easeOutBack.transform(
-                          Interval(0, 0.45).transform(_ctl.value),
-                        ),
-                        child: Opacity(
-                          opacity: Interval(0, 0.3).transform(_ctl.value),
-                          child: Image.asset(
-                            'assets/branding/brand_mark.png',
-                            width: 190,
-                            height: 190,
+        body: Center(
+          child: Container(
+            width: double.infinity,
+            child: AnimatedBuilder(
+              animation: _ctl,
+              builder: (context, _) {
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: [
+                    const Spacer(flex: 3),
+                    // Radar mark + expanding rings — the "sound around you"
+                    // cue. Rings bloom once over the 1900ms controller.
+                    SizedBox(
+                      width: 260,
+                      height: 260,
+                      child: CustomPaint(
+                        painter: _PulsePainter(_ctl.value),
+                        child: Center(
+                          child: Transform.scale(
+                            scale: Curves.easeOutBack.transform(
+                              Interval(0, 0.45).transform(_ctl.value),
+                            ),
+                            child: Opacity(
+                              opacity: Interval(0, 0.3).transform(_ctl.value),
+                              child: Image.asset(
+                                'assets/branding/brand_mark.png',
+                                width: 190,
+                                height: 190,
+                              ),
+                            ),
                           ),
                         ),
                       ),
                     ),
-                  ),
-                ),
-                const SizedBox(height: 20),
-                _stage(
-                  _ctl.value,
-                  0.35,
-                  0.7,
-                  child: const Text(
-                    'Spatial Audio Sandbox',
-                    style: TextStyle(
-                      fontSize: 22,
-                      fontWeight: FontWeight.w600,
-                      color: Color(0xFFE6EBF2),
-                      letterSpacing: 0.4,
-                    ),
-                  ),
-                ),
-                _stage(
-                  _ctl.value,
-                  0.45,
-                  0.8,
-                  child: const Padding(
-                    padding: EdgeInsets.only(top: 6),
-                    child: Text(
-                      'say a place — hear it around you',
-                      style: TextStyle(
-                        fontSize: 12.5,
-                        color: Color(0xFF9AA4B2),
+                    const SizedBox(height: 20),
+                    _stage(
+                      _ctl.value,
+                      0.35,
+                      0.7,
+                      child: const Text(
+                        'Spatial Audio Sandbox',
+                        style: TextStyle(
+                          fontSize: 22,
+                          fontWeight: FontWeight.w600,
+                          color: Color(0xFFE6EBF2),
+                          letterSpacing: 0.4,
+                        ),
                       ),
                     ),
-                  ),
-                ),
-                const SizedBox(height: 22),
-                // The pipeline as chips — the story of the stack lands
-                // before the app does.
-                _stage(
-                  _ctl.value,
-                  0.55,
-                  0.9,
-                  child: const Wrap(
-                    spacing: 6,
-                    runSpacing: 6,
-                    alignment: WrapAlignment.center,
-                    children: [
-                      _Chip(label: 'Gemma · Render'),
-                      _Chip(label: 'ElevenLabs'),
-                      _Chip(label: 'Rust · HRTF · 3D'),
-                    ],
-                  ),
-                ),
-                const Spacer(flex: 4),
-                _stage(
-                  _ctl.value,
-                  0.7,
-                  1.0,
-                  child: Padding(
-                    padding: const EdgeInsets.only(bottom: 26),
-                    child: Column(
-                      children: [
-                        Container(
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: 12,
-                            vertical: 6,
-                          ),
-                          decoration: BoxDecoration(
-                            borderRadius: BorderRadius.circular(999),
-                            border: Border.all(
-                              color: const Color(0xFF64D8CB)
-                                  .withValues(alpha: 0.5),
-                            ),
-                          ),
-                          child: const Text(
-                            'Hacktoberfest Weekend Challenge',
-                            style: TextStyle(
-                              fontSize: 11,
-                              color: Color(0xFF64D8CB),
-                              letterSpacing: 0.3,
-                            ),
-                          ),
-                        ),
-                        const SizedBox(height: 14),
-                        const Text(
-                          'tap to continue',
+                    _stage(
+                      _ctl.value,
+                      0.45,
+                      0.8,
+                      child: const Padding(
+                        padding: EdgeInsets.only(top: 6),
+                        child: Text(
+                          'say a place — hear it around you',
                           style: TextStyle(
-                            fontSize: 10,
-                            color: Color(0xFF5A6470),
+                            fontSize: 12.5,
+                            color: Color(0xFF9AA4B2),
                           ),
                         ),
-                      ],
+                      ),
                     ),
-                  ),
-                ),
-              ],
-            );
-          },
+                    const SizedBox(height: 22),
+                    // The pipeline as chips — the story of the stack lands
+                    // before the app does.
+                    _stage(
+                      _ctl.value,
+                      0.55,
+                      0.9,
+                      child: const Wrap(
+                        spacing: 6,
+                        runSpacing: 6,
+                        alignment: WrapAlignment.center,
+                        children: [
+                          _Chip(label: 'Gemma · Render'),
+                          _Chip(label: 'ElevenLabs'),
+                          _Chip(label: 'Rust · HRTF · 3D'),
+                        ],
+                      ),
+                    ),
+                    const Spacer(flex: 4),
+                    _stage(
+                      _ctl.value,
+                      0.7,
+                      1.0,
+                      child: Padding(
+                        padding: const EdgeInsets.only(bottom: 26),
+                        child: Column(
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 12,
+                                vertical: 6,
+                              ),
+                              decoration: BoxDecoration(
+                                borderRadius: BorderRadius.circular(999),
+                                border: Border.all(
+                                  color: const Color(0xFF64D8CB)
+                                      .withValues(alpha: 0.5),
+                                ),
+                              ),
+                              child: const Text(
+                                'Hacktoberfest Weekend Challenge',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  color: Color(0xFF64D8CB),
+                                  letterSpacing: 0.3,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(height: 14),
+                            const Text(
+                              'tap to continue',
+                              style: TextStyle(
+                                fontSize: 10,
+                                color: Color(0xFF5A6470),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                );
+              },
+            ),
+          ),
         ),
       ),
     );
