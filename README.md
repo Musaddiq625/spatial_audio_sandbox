@@ -1,3 +1,5 @@
+<img width="3306" height="2202" alt="spatial audio mockup" src="https://github.com/user-attachments/assets/ed29acd9-8956-4900-b2e3-8de5f429fe4b" />
+
 # Spatial Audio Sandbox
 
 Describe a place in plain words — *"I'm in the rain and a bee is
