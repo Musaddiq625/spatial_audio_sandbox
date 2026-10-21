@@ -136,3 +136,5 @@ core, pose channel, and beacon link existed before this submission
 window; the prompt→scene pipeline, scene compiler, director, meters,
 radar visualizations, calibration session, and demo pack were built
 during it. See git history for the boundary.
+
+<p align="center">Built with ❤️ by Musaddiq625</p>
