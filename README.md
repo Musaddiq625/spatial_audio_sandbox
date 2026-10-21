@@ -9,8 +9,10 @@ compiler grounds it against your prompt, ElevenLabs generates each
 sound, and a real-time Rust mixer renders every source through HRTF
 convolution while head tracking keeps the world anchored as you turn.
 
-Built for the DEV **Hacktoberfest Weekend Challenge: Build for a
-Friend** — for anyone who wishes they were somewhere else: describe the
+
+Built for [Hacktoberfest 2026 — Weekend Challenge: Build for a Friend](https://dev.to/challenges/hf26)
+
+For anyone who wishes they were somewhere else: describe the
 place, put on headphones, be there.
 
 ## The pipeline (visible in-app)
