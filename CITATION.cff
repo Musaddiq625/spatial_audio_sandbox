@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+title: "Spatial Audio Sandbox"
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - given-names: "Musaddiq Ahmed"
+    family-names: "Khan"
+    alias: "Musaddiq625"
+    orcid: "https://orcid.org/0009-0006-4505-9075"
+identifiers:
+  - type: doi
+    value: "10.5281/zenodo.24157961"
+version: "v1.0.0"
+license: "MIT"
+repository-code: "https://github.com/Musaddiq625/spatial_audio_sandbox"
+url: "https://doi.org/10.5281/zenodo.24157961"
+date-released: "2026-11-12"
+abstract: "Describe a place in plain words and this app builds it as a live
+  binaural 3D audio scene on your headphones. A Gemma model plans the
+  scene, a deterministic Dart compiler grounds it against the prompt,
+  ElevenLabs generates each sound, and a real-time Rust mixer renders
+  every source through synthetic HRTF convolution while Android head
+  tracking keeps the world anchored as you turn."
+keywords:
+  - binaural audio
+  - HRTF
+  - spatial audio
+  - head tracking
+  - Flutter
+  - Rust
+  - Gemma
+  - ElevenLabs

@@ -2,6 +2,8 @@
 
 # Spatial Audio Sandbox
 
+[![DOI](https://zenodo.org/badge/1403397093.svg)](https://doi.org/10.5281/zenodo.24157961)
+
 Describe a place in plain words — *"I'm in the rain and a bee is
 circling my head"* — and this app builds it as a live binaural 3D audio
 scene on your headphones. A Gemma model plans the scene, a deterministic
